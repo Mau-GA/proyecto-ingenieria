@@ -1,0 +1,227 @@
+# Sistema de Administración de Restaurante
+
+## Descripción del proyecto
+
+Este proyecto consiste en el desarrollo de un sistema web para la administración integral de un restaurante. El objetivo es centralizar y facilitar la gestión de productos, insumos, recetas, inventario, proveedores, compras, mesas, órdenes, pagos, clientes, empleados y reportes mediante una aplicación accesible desde un navegador web.
+
+El sistema está pensado para ser utilizado en un entorno real y no únicamente como un proyecto académico. Por esta razón, se busca construir una aplicación organizada, escalable y mantenible, con una base de datos correctamente normalizada y una arquitectura que permita agregar nuevas funcionalidades posteriormente.
+
+La aplicación permitirá que diferentes usuarios trabajen de acuerdo con sus responsabilidades dentro del restaurante. El administrador tendrá acceso a las funciones de configuración y administración del sistema, mientras que los gerentes y empleados tendrán acceso únicamente a las funciones correspondientes a sus permisos.
+
+## Objetivo
+
+El objetivo principal es desarrollar una plataforma web que permita controlar las operaciones principales de un restaurante desde un solo sistema.
+
+Entre las principales funciones se encuentran la administración de usuarios y empleados, productos y categorías, insumos, recetas, inventario, proveedores, compras, mesas, órdenes, pagos y clientes. También se contempla el registro de pedidos para llevar y pedidos provenientes de plataformas externas como Rappi, Uber Eats y DiDi Food.
+
+En la primera versión no se realizarán integraciones mediante APIs con estas plataformas. Los pedidos externos serán registrados manualmente por los empleados, indicando la plataforma correspondiente. La estructura del sistema deberá permitir agregar integraciones posteriormente si se consideran necesarias.
+
+## Tecnologías
+
+El proyecto utilizará una arquitectura web basada principalmente en PHP, HTML, CSS y JavaScript.
+
+La información será almacenada en MySQL. Durante el desarrollo, la aplicación y la base de datos se ejecutarán mediante Docker para que todos los integrantes del equipo puedan trabajar con un entorno similar independientemente de que utilicen Windows o Linux.
+
+Git y GitHub serán utilizados para controlar las versiones del código y permitir el trabajo colaborativo entre los integrantes del equipo.
+
+La arquitectura general será navegador del usuario, frontend, backend PHP y base de datos MySQL. Docker será utilizado como entorno de desarrollo y podrá utilizarse posteriormente para el despliegue.
+
+## Arquitectura general
+
+El usuario accederá al sistema mediante un navegador desde una computadora, tablet u otro dispositivo compatible. No será necesario instalar PHP, MySQL ni Docker en los dispositivos que únicamente utilicen el sistema.
+
+El frontend estará compuesto por HTML, CSS y JavaScript y será responsable de la interfaz con la que interactuarán los usuarios.
+
+El backend estará desarrollado en PHP, Python y será responsable de procesar las solicitudes, validar permisos, aplicar las reglas de negocio, comunicarse con la base de datos y controlar las operaciones del sistema.
+
+MySQL almacenará la información permanente del sistema. La base de datos deberá mantener integridad referencial mediante claves primarias y foráneas y deberá seguir una estructura normalizada.
+
+Durante el desarrollo, Docker permitirá levantar los servicios necesarios de manera local. Al finalizar el proyecto se decidirá si el sistema se ejecutará en un servidor local dentro del restaurante o si será desplegado en un servidor externo.
+
+## Módulos principales
+
+El sistema estará dividido conceptualmente en diferentes módulos para facilitar su desarrollo y mantenimiento.
+
+El módulo de usuarios y empleados administrará las cuentas que pueden acceder al sistema, los empleados registrados y los roles y permisos correspondientes.
+
+El módulo de productos administrará los productos que se venden en el restaurante, sus categorías, precios, disponibilidad y demás información necesaria.
+
+El módulo de insumos e inventario permitirá registrar los ingredientes y materiales utilizados por el restaurante, controlar existencias, establecer cantidades mínimas y registrar entradas, salidas, mermas y ajustes.
+
+El módulo de recetas relacionará los productos con los insumos necesarios para prepararlos. Esto permitirá que el sistema pueda determinar qué cantidades de inventario deben descontarse cuando se realiza una venta.
+
+El módulo de proveedores y compras permitirá registrar proveedores y administrar las compras de insumos, incluyendo sus respectivos detalles, cantidades y costos.
+
+El módulo de mesas permitirá visualizar las mesas y su estado. Las mesas podrán encontrarse disponibles, ocupadas, reservadas o en otros estados definidos por las reglas del sistema.
+
+El módulo de órdenes permitirá registrar los consumos de las mesas, pedidos para llevar y pedidos externos. Cada orden podrá contener diferentes productos y cantidades mediante sus detalles correspondientes.
+
+El módulo de pagos permitirá registrar los pagos asociados a las órdenes y diferentes métodos de pago. La estructura deberá permitir que una misma orden pueda tener más de un pago cuando sea necesario dividir una cuenta.
+
+El módulo de reportes permitirá consultar información relacionada con ventas, productos, empleados, inventario, compras, métodos de pago y otros datos relevantes para la administración del restaurante.
+
+El módulo de auditoría permitirá registrar operaciones importantes realizadas por los usuarios, especialmente aquellas relacionadas con modificaciones, cancelaciones, ajustes de inventario y otras acciones que requieran trazabilidad.
+
+## Inventario y recetas
+
+Uno de los procesos importantes del sistema será la relación entre productos, recetas e inventario.
+
+Una receta definirá los insumos y cantidades necesarias para preparar un producto. Por ejemplo, una hamburguesa puede requerir una determinada cantidad de carne, pan, queso, lechuga y tomate.
+
+Cuando se registre una venta de dos hamburguesas, el sistema podrá utilizar la receta para determinar las cantidades correspondientes que deben descontarse del inventario.
+
+Además de las salidas generadas por ventas, el sistema deberá permitir registrar movimientos por compras, mermas, ajustes y otros motivos contemplados por las reglas del sistema.
+
+Las unidades de medida deberán manejarse de forma consistente para evitar errores al trabajar con piezas, kilogramos, litros u otras unidades.
+
+## Órdenes y ventas
+
+Las órdenes podrán estar asociadas a una mesa cuando correspondan a consumo dentro del restaurante. También deberán poder registrarse órdenes para llevar y pedidos provenientes de plataformas externas.
+
+Cada orden podrá contener uno o varios productos mediante los detalles de la orden. El precio unitario utilizado en el momento de realizar la venta deberá conservarse para mantener correctamente el historial, incluso si posteriormente cambia el precio actual del producto.
+
+Los pagos se registrarán de manera independiente de la orden para permitir diferentes métodos de pago y, cuando sea necesario, múltiples pagos para una misma cuenta.
+
+## Roles y permisos
+
+El sistema utilizará un esquema de roles y permisos para controlar el acceso a las diferentes funciones.
+
+El administrador tendrá acceso a las funciones generales de configuración y administración del sistema.
+
+El gerente tendrá acceso principalmente a funciones administrativas y operativas como reportes, ventas, inventario, mesas y órdenes, de acuerdo con los permisos definidos.
+
+El empleado tendrá acceso a las operaciones necesarias para realizar su trabajo, como administrar mesas, registrar órdenes y procesar las operaciones que le correspondan.
+
+Los permisos definitivos deberán establecerse en la base de datos y aplicarse también desde el backend. La interfaz no debe ser considerada el único mecanismo de seguridad.
+
+## Base de datos
+
+La base de datos será diseñada siguiendo principios de normalización y deberá mantener una separación clara entre las diferentes entidades del sistema.
+
+Las tablas deberán tener responsabilidades específicas y las relaciones deberán establecerse mediante claves primarias y foráneas.
+
+Los valores monetarios deberán utilizar tipos DECIMAL. Las tablas utilizarán InnoDB y la base de datos deberá utilizar codificación utf8mb4.
+
+No se deberán almacenar contraseñas en texto plano. Las contraseñas deberán almacenarse mediante hashes seguros generados y verificados desde el backend.
+
+La estructura final de la base de datos deberá documentarse mediante un diagrama entidad-relación que represente las tablas, PK, FK y cardinalidades.
+
+## Estructura del repositorio
+
+La estructura propuesta del proyecto es la siguiente:
+
+```text
+restaurant/
+│
+├── backend/
+│   ├── config/
+│   ├── controllers/
+│   ├── models/
+│   ├── services/
+│   └── ...
+│
+├── frontend/
+│   ├── css/
+│   ├── js/
+│   ├── pages/
+│   └── ...
+│
+├── database/
+│   ├── schema.sql
+│   ├── seed.sql
+│   └── migrations/
+│
+├── docs/
+│   ├── diagrams/
+│   └── ...
+│
+├── assets/
+│
+├── docker/
+│
+├── docker-compose.yml
+├── Dockerfile
+├── .env.example
+├── .gitignore
+└── README.md
+```
+
+La estructura podrá modificarse conforme avance el proyecto, pero cualquier cambio importante deberá mantenerse organizado y documentado.
+
+## Desarrollo con Docker
+
+Durante el desarrollo cada integrante podrá clonar el repositorio y levantar el proyecto mediante Docker.
+
+El objetivo es que las dependencias principales del proyecto estén definidas dentro de la configuración del repositorio para reducir diferencias entre los entornos de desarrollo.
+
+No es necesario contratar un servidor en la nube durante la etapa de desarrollo. Todo el sistema puede desarrollarse localmente utilizando Docker y GitHub.
+
+El despliegue definitivo se decidirá cuando el sistema esté terminado. Dependiendo de las necesidades del restaurante, podrá utilizarse un servidor local o un servidor externo.
+
+## Trabajo colaborativo con Git y GitHub
+
+La rama `main` representará la versión estable del proyecto y no deberá utilizarse para desarrollar directamente.
+
+Se recomienda utilizar una rama `develop` para integrar las funcionalidades antes de incorporarlas a `main`.
+
+Cada integrante deberá trabajar principalmente mediante ramas independientes para cada funcionalidad. Algunos ejemplos son:
+
+```text
+feature/login
+feature/inventario
+feature/mesas
+feature/ordenes
+feature/reportes
+feature/productos
+feature/compras
+```
+
+Los cambios deberán realizarse mediante commits pequeños y descriptivos. Una vez terminada una funcionalidad, se deberá crear un Pull Request para revisar los cambios antes de integrarlos.
+
+No se deberán subir directamente al repositorio contraseñas, tokens, claves API, archivos `.env`, credenciales de bases de datos ni información privada del restaurante.
+
+El archivo `.env.example` deberá contener únicamente las variables necesarias como referencia, sin valores sensibles reales.
+
+## Reglas para trabajar en el repositorio
+
+Antes de comenzar una tarea, cada integrante deberá actualizar su repositorio local para trabajar sobre la versión más reciente.
+
+No se deberán modificar archivos que otro integrante esté utilizando sin coordinación previa.
+
+Cuando una funcionalidad dependa de cambios en la base de datos, dichos cambios deberán documentarse dentro de `database/` y comunicarse al equipo.
+
+No se deberán eliminar tablas, columnas o relaciones importantes sin revisar primero el impacto que tendrán sobre el resto del sistema.
+
+Los cambios estructurales importantes deberán acompañarse de la actualización correspondiente de la documentación y de los diagramas.
+
+## Datos y seguridad
+
+Los datos de prueba deberán mantenerse separados de cualquier información real del restaurante.
+
+Nunca deberán incluirse en GitHub contraseñas reales, credenciales de acceso, tokens, claves privadas o información sensible.
+
+Las validaciones importantes deberán realizarse en el backend aunque también existan validaciones en JavaScript.
+
+El sistema deberá utilizar consultas preparadas o mecanismos equivalentes para evitar inyecciones SQL.
+
+Las operaciones importantes, como cancelaciones, modificaciones críticas y ajustes de inventario, deberán contar con los controles necesarios para mantener la integridad y trazabilidad de la información.
+
+## Documentación
+
+La documentación del proyecto se almacenará principalmente dentro de la carpeta `docs/`.
+
+Deberán mantenerse actualizados los diagramas de base de datos, arquitectura y procesos importantes del sistema.
+
+El Diagrama Entidad-Relación deberá corresponder siempre con la versión actual de la base de datos. Si se modifica una PK, FK, tabla o relación importante, el diagrama deberá actualizarse.
+
+También deberán documentarse las decisiones de arquitectura y las reglas de negocio que puedan afectar el desarrollo de otros módulos.
+
+## Objetivo final
+
+El objetivo final es obtener un sistema web de administración de restaurante funcional, organizado y preparado para utilizarse desde un navegador.
+
+El sistema deberá permitir administrar las operaciones principales del restaurante desde una sola plataforma, manteniendo la información centralizada y reduciendo la necesidad de procesos manuales.
+
+La arquitectura deberá permitir que el proyecto continúe creciendo después de la primera versión, de manera que puedan incorporarse posteriormente nuevas funciones, integraciones con plataformas externas, mejoras de reportes o un despliegue en la nube sin tener que reconstruir completamente el sistema.
+
+Este repositorio contiene el código fuente y la documentación necesarios para desarrollar el proyecto de manera colaborativa y mantener una versión controlada del sistema durante todo su ciclo de desarrollo.

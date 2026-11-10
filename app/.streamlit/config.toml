@@ -1,0 +1,15 @@
+# Ruta: proyectorestaurante/app/.streamlit/config.toml
+# Tema oscuro nativo, coherente con style.css
+[theme]
+base = "dark"
+primaryColor = "#ff5a5f"
+backgroundColor = "#17171c"
+secondaryBackgroundColor = "#212128"
+textColor = "#f2f2f2"
+
+[server]
+headless = true
+runOnSave = true
+
+[browser]
+gatherUsageStats = false

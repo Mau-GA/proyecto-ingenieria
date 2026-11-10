@@ -1,0 +1,65 @@
+/* Paleta inspirada en la referencia visual proporcionada (tema oscuro,
+   acentos rojo/naranja, tarjetas redondeadas tipo POS). */
+:root {
+    --bg-dark: #17171c;
+    --bg-card: #212128;
+    --accent: #ff5a5f;
+    --accent-soft: rgba(255, 90, 95, 0.15);
+    --text-light: #f2f2f2;
+    --text-muted: #9a9aa5;
+}
+
+.stApp {
+    background-color: var(--bg-dark);
+    color: var(--text-light);
+}
+
+section[data-testid="stSidebar"] {
+    background-color: #1c1c22;
+    border-right: 1px solid #2a2a33;
+}
+
+div[data-testid="stMetric"], .pos-card {
+    background-color: var(--bg-card);
+    border-radius: 14px;
+    padding: 16px;
+    border: 1px solid #2a2a33;
+}
+
+.stButton > button {
+    border-radius: 10px;
+    border: 1px solid var(--accent);
+    background-color: transparent;
+    color: var(--accent);
+}
+.stButton > button:hover {
+    background-color: var(--accent);
+    color: #fff;
+}
+.pos-card-title { color: var(--text-muted); font-size: 0.85rem; }
+.pos-card-value { color: var(--text-light); font-size: 1.4rem; font-weight: 700; }
+
+/* --- Login --- */
+.login-spacer { height: 4vh; }
+
+.login-welcome {
+    margin: 0 0 1rem 0;
+    text-align: center;
+    color: var(--text-light);
+    font-size: 2rem;
+    letter-spacing: -0.5px;
+}
+
+/* --- Etiqueta de producto mermado --- */
+.tag-mermado {
+    display: inline-block;
+    background: rgba(255, 90, 95, 0.18);
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 999px;
+    padding: 0.1rem 0.55rem;
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.6px;
+    margin-right: 0.4rem;
+}

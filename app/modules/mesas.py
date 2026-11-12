@@ -7,8 +7,6 @@ from permissions import requerir_rol, requerir_accion, ADMIN, GERENTE, MESERO
 COLOR_ESTADO = {
     "Disponible": "#2ecc71",
     "Ocupada": "#ff5a5f",
-    "Reservada": "#f1c40f",
-    "Fuera de servicio": "#7f8c8d",
 }
 
 

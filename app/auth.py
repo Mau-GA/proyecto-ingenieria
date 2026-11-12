@@ -58,10 +58,10 @@ def _roles_activos(id_usuario: int) -> list[str]:
 def _limpiar_estado_sesion() -> None:
     for clave in _CLAVES_SESION:
         st.session_state.pop(clave, None)
-    # Widgets de captura de mermas: no deben arrastrar el motivo capturado
-    # de una sesión a otra.
+    # Widgets de captura de mermas y compras: no deben arrastrar datos
+    # capturados de una sesión a otra.
     for clave in list(st.session_state.keys()):
-        if str(clave).startswith("merma_"):
+        if str(clave).startswith(("merma_", "compras_")):
             st.session_state.pop(clave, None)
 
 

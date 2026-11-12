@@ -97,7 +97,7 @@ def ventas_de_hoy():
         SELECT COUNT(DISTINCT p.id_orden) AS ordenes,
                COALESCE(SUM(p.monto), 0) AS total
         FROM pagos p
-        WHERE DATE(p.fecha_pago) = CURDATE()
+        WHERE DATE(p.fecha_pago) = CURRENT_DATE
         """
     ).iloc[0]
 
@@ -182,9 +182,9 @@ def _render_ultima_venta() -> None:
     venta = st.session_state.get(K_ULTIMA)
     if not venta:
         return
-    turno = venta.get("numero_dia", venta["id_orden"])
+    numero_orden = venta.get("numero_dia", venta["id_orden"])
     st.success(
-        f"Comanda turno #{turno} registrada · Total {fmt(venta['total'])} · "
+        f"Comanda orden #{numero_orden} registrada · Total {fmt(venta['total'])} · "
         "Pendiente de cobro en Órdenes > Delivery"
     )
     if venta["inventario"]:

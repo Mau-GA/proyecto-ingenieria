@@ -151,6 +151,7 @@ def _upsert_usuario(
                 """
                 INSERT INTO usuarios (id_empleado, nombre_usuario, password_hash, activo)
                 VALUES (:id_empleado, :usuario, :password_hash, TRUE)
+                RETURNING id_usuario
                 """
             ),
             {
@@ -159,7 +160,7 @@ def _upsert_usuario(
                 "password_hash": password_hash,
             },
         )
-        id_usuario = int(resultado.lastrowid)
+        id_usuario = int(resultado.scalar_one())
         accion = "creado"
 
     conn.execute(

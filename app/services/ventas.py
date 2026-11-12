@@ -114,7 +114,7 @@ def _guardar_comentario(
             INSERT INTO auditoria
                 (id_usuario, tabla_afectada, id_registro_afectado, accion, datos_nuevos)
             VALUES
-                (:usuario, 'detalles_orden_comentario', :detalle, 'INSERT', :datos)
+                (:usuario, 'detalles_orden_comentario', :detalle, 'INSERT', CAST(:datos AS jsonb))
             """
         ),
         {
@@ -158,25 +158,27 @@ def recalcular_total_orden(conn: Connection, id_orden: int) -> Decimal:
     return total
 
 
-def numero_turno_del_dia(conn: Connection, id_orden: int) -> int:
-    """Número consecutivo de la orden dentro de su día.
+def siguiente_numero_orden_diaria(conn: Connection) -> int:
+    """Siguiente consecutivo visible de orden para la fecha actual.
 
-    Se calcula desde la fecha de la propia orden, así que el primer pedido de
-    cada día vuelve a ser 1 y no se acumula el histórico de días anteriores.
+    Se guarda en ``ordenes.numero_orden_diaria`` y reinicia a 1 cada día.
+    El advisory lock serializa la asignación entre transacciones simultáneas
+    para que dos órdenes del mismo día no reciban el mismo número.
     """
+    conn.execute(
+        text(
+            "SELECT pg_advisory_xact_lock(hashtext('ordenes_dia_' || CURRENT_DATE::text))"
+        )
+    )
     return int(
         conn.execute(
             text(
                 """
-                SELECT COUNT(*)
-                FROM ordenes o2
-                WHERE DATE(o2.fecha_orden) = (
-                    SELECT DATE(fecha_orden) FROM ordenes WHERE id_orden = :o
-                )
-                  AND o2.id_orden <= :o
+                SELECT COALESCE(MAX(numero_orden_diaria), 0) + 1
+                FROM ordenes
+                WHERE DATE(fecha_orden) = CURRENT_DATE
                 """
-            ),
-            {"o": id_orden},
+            )
         ).scalar_one()
     )
 
@@ -398,6 +400,7 @@ def agregar_partidas(
                 INSERT INTO detalles_orden (id_orden, id_producto, cantidad,
                                             precio_unitario, id_area_preparacion, id_estado)
                 VALUES (:orden, :producto, :cantidad, :precio, :area, :estado)
+                RETURNING id_detalle
                 """
             ),
             {
@@ -408,7 +411,7 @@ def agregar_partidas(
         )
         _guardar_comentario(
             conn,
-            id_detalle=int(resultado.lastrowid),
+            id_detalle=int(resultado.scalar_one()),
             id_usuario=id_usuario,
             comentario=p.get("comentario"),
         )
@@ -443,21 +446,28 @@ def registrar_venta(
         id_pagada = _id_por_nombre(
             conn, "SELECT id_estado FROM estados_orden WHERE nombre = :n", "Pagada"
         )
+        numero_dia = siguiente_numero_orden_diaria(conn)
         res = conn.execute(
             text(
                 """
                 INSERT INTO ordenes (id_tipo_orden, id_mesa, id_empleado_atiende, id_usuario_registro,
-                                     id_plataforma_externa, referencia_externa, id_estado, total)
-                VALUES (:tipo, :mesa, :empleado, :usuario, :plataforma, :ref_ext, :estado, 0)
+                                     id_plataforma_externa, referencia_externa, id_estado, total,
+                                     numero_orden_diaria)
+                VALUES (:tipo, :mesa, :empleado, :usuario, :plataforma, :ref_ext, :estado, 0,
+                        :numero_dia)
+                RETURNING id_orden, numero_orden_diaria
                 """
             ),
             {
                 "tipo": id_tipo_orden, "mesa": id_mesa, "empleado": id_empleado,
                 "usuario": id_usuario, "plataforma": id_plataforma,
                 "ref_ext": referencia_externa or None, "estado": id_pagada,
+                "numero_dia": numero_dia,
             },
         )
-        id_orden = int(res.lastrowid)
+        fila_orden = res.mappings().one()
+        id_orden = int(fila_orden["id_orden"])
+        numero_dia = int(fila_orden["numero_orden_diaria"])
 
         total, resumen = agregar_partidas(
             conn, id_orden=id_orden, partidas=partidas, id_empleado=id_empleado,
@@ -478,7 +488,6 @@ def registrar_venta(
                 "ref": referencia_pago or None, "usuario": id_usuario,
             },
         )
-        numero_dia = numero_turno_del_dia(conn, id_orden)
 
     return {
         "id_orden": id_orden,
@@ -501,30 +510,36 @@ def registrar_comanda(
     """Registra una comanda que queda pendiente de cobro (FoodHouse).
 
     Crea la orden en estado 'Pendiente' (sin pago), inserta sus partidas ya
-    desglosadas 1 a 1, descuenta inventario y calcula el turno del día. El
-    cobro posterior se hace desde Órdenes.
+    desglosadas 1 a 1, descuenta inventario y asigna el número de orden del
+    día. El cobro posterior se hace desde Órdenes.
     """
     with transaccion() as conn:
         id_pendiente = _id_por_nombre(
             conn, "SELECT id_estado FROM estados_orden WHERE nombre = :n", "Pendiente"
         )
+        numero_dia = siguiente_numero_orden_diaria(conn)
         res = conn.execute(
             text(
                 """
                 INSERT INTO ordenes (id_tipo_orden, id_mesa, id_empleado_atiende,
                                      id_usuario_registro, id_plataforma_externa,
-                                     referencia_externa, id_estado, total)
+                                     referencia_externa, id_estado, total,
+                                     numero_orden_diaria)
                 VALUES (:tipo, :mesa, :empleado, :usuario, :plataforma, :ref_ext,
-                        :estado, 0)
+                        :estado, 0, :numero_dia)
+                RETURNING id_orden, numero_orden_diaria
                 """
             ),
             {
                 "tipo": id_tipo_orden, "mesa": id_mesa, "empleado": id_empleado,
                 "usuario": id_usuario, "plataforma": id_plataforma,
                 "ref_ext": referencia_externa or None, "estado": id_pendiente,
+                "numero_dia": numero_dia,
             },
         )
-        id_orden = int(res.lastrowid)
+        fila_orden = res.mappings().one()
+        id_orden = int(fila_orden["id_orden"])
+        numero_dia = int(fila_orden["numero_orden_diaria"])
 
         total, resumen = agregar_partidas(
             conn, id_orden=id_orden, partidas=partidas, id_empleado=id_empleado,
@@ -532,8 +547,6 @@ def registrar_comanda(
         )
         if total <= 0:
             raise VentaError("La comanda debe tener un total mayor a cero.")
-
-        numero_dia = numero_turno_del_dia(conn, id_orden)
 
     return {
         "id_orden": id_orden,
@@ -559,7 +572,7 @@ def guardar_orden_mesa(
         existente = conn.execute(
             text(
                 """
-                SELECT o.id_orden
+                SELECT o.id_orden, o.numero_orden_diaria
                 FROM ordenes o
                 JOIN estados_orden e ON e.id_estado = o.id_estado
                 WHERE o.id_mesa = :m AND e.es_final = FALSE
@@ -568,7 +581,7 @@ def guardar_orden_mesa(
                 """
             ),
             {"m": id_mesa},
-        ).scalar()
+        ).mappings().first()
 
         if existente is None:
             id_local = _id_por_nombre(
@@ -577,27 +590,33 @@ def guardar_orden_mesa(
             id_pendiente = _id_por_nombre(
                 conn, "SELECT id_estado FROM estados_orden WHERE nombre = :n", "Pendiente"
             )
+            numero_dia = siguiente_numero_orden_diaria(conn)
             res = conn.execute(
                 text(
                     """
                     INSERT INTO ordenes (id_tipo_orden, id_mesa, id_empleado_atiende,
-                                         id_usuario_registro, id_estado, total)
-                    VALUES (:tipo, :mesa, :empleado, :usuario, :estado, 0)
+                                         id_usuario_registro, id_estado, total,
+                                         numero_orden_diaria)
+                    VALUES (:tipo, :mesa, :empleado, :usuario, :estado, 0, :numero_dia)
+                    RETURNING id_orden, numero_orden_diaria
                     """
                 ),
                 {"tipo": id_local, "mesa": id_mesa, "empleado": id_empleado,
-                 "usuario": id_usuario, "estado": id_pendiente},
+                 "usuario": id_usuario, "estado": id_pendiente,
+                 "numero_dia": numero_dia},
             )
-            id_orden = int(res.lastrowid)
+            fila_orden = res.mappings().one()
+            id_orden = int(fila_orden["id_orden"])
+            numero_dia = int(fila_orden["numero_orden_diaria"])
             conn.execute(text("UPDATE mesas SET estado = 'Ocupada' WHERE id_mesa = :m"), {"m": id_mesa})
         else:
-            id_orden = int(existente)
+            id_orden = int(existente["id_orden"])
+            numero_dia = int(existente["numero_orden_diaria"])
 
         total, resumen = agregar_partidas(
             conn, id_orden=id_orden, partidas=partidas, id_empleado=id_empleado,
             id_usuario=id_usuario,
         )
-        numero_dia = numero_turno_del_dia(conn, id_orden)
 
     return {
         "id_orden": id_orden,
@@ -675,6 +694,29 @@ def eliminar_partida(
                 )
 
     return total
+
+
+def limpiar_comandas_listas() -> int:
+    """Pasa todas las partidas en ``Listo`` a ``Entregado`` en una transacción."""
+    with transaccion() as conn:
+        id_listo = _id_por_nombre(
+            conn,
+            "SELECT id_estado FROM estados_detalle_orden WHERE nombre = :n",
+            "Listo",
+        )
+        id_entregado = _id_por_nombre(
+            conn,
+            "SELECT id_estado FROM estados_detalle_orden WHERE nombre = :n",
+            "Entregado",
+        )
+        resultado = conn.execute(
+            text(
+                "UPDATE detalles_orden SET id_estado = :entregado "
+                "WHERE id_estado = :listo"
+            ),
+            {"entregado": id_entregado, "listo": id_listo},
+        )
+        return int(resultado.rowcount or 0)
 
 
 def cobrar_orden_mesa(*, id_orden: int, id_mesa: int | None, id_metodo_pago: int,

@@ -1,4 +1,4 @@
-"""Módulo de Inventario: existencias por categoría, ajustes y gestión de mermas."""
+"""Módulo de Inventario: stock crítico, insumos, existencias, ajustes y mermas."""
 from decimal import Decimal
 
 import streamlit as st
@@ -272,6 +272,280 @@ def _render_reporte_individual(reporte) -> None:
             st.caption("✔ Merma subida: el stock ya fue descontado.")
 
 
+def _unidad_obligatoria(nombre: str) -> bool:
+    """True para insumos que deben manejarse siempre por pieza."""
+    texto = str(nombre or "").casefold()
+    return any(clave in texto for clave in ("alita", "coca", "refresco", "soda"))
+
+
+def _render_stock_critico() -> None:
+    """Vista concentrada de insumos activos en o bajo su punto de reorden."""
+    criticos = run_query(
+        """
+        SELECT i.nombre AS insumo, c.nombre AS categoria,
+               u.abreviatura AS unidad, i.stock_actual, i.stock_minimo,
+               (i.stock_minimo - i.stock_actual) AS faltante
+        FROM insumos i
+        JOIN categorias_insumos c ON c.id_categoria = i.id_categoria
+        JOIN unidades_medida u ON u.id_unidad = i.id_unidad_medida
+        WHERE i.activo = TRUE
+          AND i.stock_actual <= i.stock_minimo
+        ORDER BY (i.stock_actual - i.stock_minimo), i.nombre
+        """
+    )
+    st.caption(
+        "Insumos activos cuyo stock actual es menor o igual a su stock mínimo. "
+        "Ordenados por faltante para priorizar las compras."
+    )
+    if criticos.empty:
+        st.success("Ningún insumo está en stock crítico.")
+        return
+
+    st.error(f"{len(criticos)} insumo(s) requieren reposición.")
+    st.dataframe(
+        criticos.rename(
+            columns={
+                "insumo": "Insumo",
+                "categoria": "Categoría",
+                "unidad": "Unidad",
+                "stock_actual": "Stock actual",
+                "stock_minimo": "Stock mínimo",
+                "faltante": "Faltante",
+            }
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+def _render_catalogo_insumos() -> None:
+    """Alta y edición de insumos, forzando piezas en alitas y refrescos."""
+    requerir_accion("inventario.gestionar")
+    insumos = run_query(
+        """
+        SELECT i.id_insumo, i.nombre, i.descripcion, i.id_categoria,
+               i.id_unidad_medida, c.nombre AS categoria,
+               u.nombre AS unidad, u.abreviatura, i.stock_actual,
+               i.stock_minimo, i.costo_unitario_referencia, i.activo
+        FROM insumos i
+        JOIN categorias_insumos c ON c.id_categoria = i.id_categoria
+        JOIN unidades_medida u ON u.id_unidad = i.id_unidad_medida
+        ORDER BY i.nombre
+        """
+    )
+    categorias = run_query(
+        "SELECT id_categoria, nombre FROM categorias_insumos ORDER BY nombre"
+    ).to_dict("records")
+    unidades = run_query(
+        "SELECT id_unidad, nombre, abreviatura FROM unidades_medida ORDER BY id_unidad"
+    ).to_dict("records")
+    if not categorias or not unidades:
+        st.warning(
+            "Registra al menos una categoría de insumo y una unidad de medida."
+        )
+        return
+
+    pieza = next(
+        (
+            unidad
+            for unidad in unidades
+            if str(unidad["abreviatura"]).casefold() == "pza"
+        ),
+        None,
+    )
+    if pieza is None:
+        st.error("Falta la unidad de medida 'Pieza' (pza) en el catálogo.")
+        return
+
+    if not insumos.empty:
+        st.dataframe(
+            insumos.drop(
+                columns=["id_insumo", "id_categoria", "id_unidad_medida"]
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    opciones = [{"id_insumo": 0, "nombre": "➕ Nuevo insumo"}] + (
+        insumos[["id_insumo", "nombre"]].to_dict("records")
+        if not insumos.empty
+        else []
+    )
+    seleccion = st.selectbox(
+        "Insumo a editar",
+        opciones,
+        format_func=lambda insumo: insumo["nombre"],
+    )
+    id_seleccionado = int(seleccion["id_insumo"])
+    actual = (
+        insumos[insumos["id_insumo"] == id_seleccionado].iloc[0].to_dict()
+        if id_seleccionado
+        else None
+    )
+
+    indice_categoria = next(
+        (
+            indice
+            for indice, categoria in enumerate(categorias)
+            if actual
+            and int(categoria["id_categoria"]) == int(actual["id_categoria"])
+        ),
+        0,
+    )
+    indice_unidad = next(
+        (
+            indice
+            for indice, unidad in enumerate(unidades)
+            if actual
+            and int(unidad["id_unidad"]) == int(actual["id_unidad_medida"])
+        ),
+        0,
+    )
+
+    st.caption(
+        "Los insumos de alitas, coca, refrescos o soda se guardan siempre "
+        "con unidad Pieza (pza), aunque se elija otra."
+    )
+    with st.form("form_insumo", clear_on_submit=True):
+        nombre = st.text_input(
+            "Nombre",
+            value=str(actual["nombre"]) if actual else "",
+        )
+        descripcion = st.text_input(
+            "Descripción",
+            value=str(actual["descripcion"] or "") if actual else "",
+        )
+        categoria = st.selectbox(
+            "Categoría",
+            categorias,
+            index=indice_categoria,
+            format_func=lambda item: item["nombre"],
+        )
+        unidad = st.selectbox(
+            "Unidad de medida",
+            unidades,
+            index=(
+                next(
+                    (
+                        indice
+                        for indice, item in enumerate(unidades)
+                        if int(item["id_unidad"]) == int(pieza["id_unidad"])
+                    ),
+                    0,
+                )
+                if _unidad_obligatoria(
+                    str(actual["nombre"]) if actual else ""
+                )
+                else indice_unidad
+            ),
+            format_func=lambda item: (
+                f"{item['nombre']} ({item['abreviatura']})"
+            ),
+        )
+        stock_minimo = st.number_input(
+            "Stock mínimo",
+            min_value=0.0,
+            value=float(actual["stock_minimo"]) if actual else 0.0,
+            step=0.1,
+            format="%.3f",
+        )
+        costo = st.number_input(
+            "Costo unitario de referencia",
+            min_value=0.0,
+            value=(
+                float(actual["costo_unitario_referencia"] or 0)
+                if actual
+                else 0.0
+            ),
+            step=1.0,
+            format="%.2f",
+        )
+        if actual:
+            st.caption(
+                f"Stock actual: {float(actual['stock_actual']):.3f} "
+                f"{actual['abreviatura']}. Usa 'Registrar ajuste' para "
+                "modificarlo."
+            )
+        else:
+            st.caption(
+                "El stock inicial se carga después desde 'Registrar ajuste'."
+            )
+        activo = st.checkbox(
+            "Activo",
+            value=bool(actual["activo"]) if actual else True,
+        )
+        enviado = st.form_submit_button("Guardar insumo")
+
+    if not enviado:
+        return
+
+    requerir_accion("inventario.gestionar")
+    if not nombre.strip():
+        st.error("El nombre del insumo es obligatorio.")
+        return
+
+    id_unidad = int(unidad["id_unidad"])
+    if _unidad_obligatoria(nombre):
+        id_unidad = int(pieza["id_unidad"])
+
+    if actual and id_unidad != int(actual["id_unidad_medida"]):
+        dependencias = run_query(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM recetas WHERE id_insumo = :id) AS recetas,
+                (SELECT COUNT(*) FROM movimientos_inventario
+                 WHERE id_insumo = :id) AS movimientos
+            """,
+            {"id": id_seleccionado},
+        ).iloc[0]
+        if int(dependencias["recetas"]) or int(dependencias["movimientos"]):
+            st.error(
+                "No se puede cambiar la unidad de un insumo que ya tiene "
+                "recetas o movimientos. Usa el script de conversión o ajusta "
+                "primero sus recetas e historial."
+            )
+            return
+
+    parametros = {
+        "n": nombre.strip(),
+        "d": descripcion.strip() or None,
+        "c": int(categoria["id_categoria"]),
+        "u": id_unidad,
+        "sm": stock_minimo,
+        "costo": costo,
+        "a": activo,
+    }
+    try:
+        if actual:
+            execute(
+                """
+                UPDATE insumos
+                SET nombre = :n, descripcion = :d, id_categoria = :c,
+                    id_unidad_medida = :u, stock_minimo = :sm,
+                    costo_unitario_referencia = :costo, activo = :a
+                WHERE id_insumo = :id
+                """,
+                {**parametros, "id": id_seleccionado},
+            )
+            st.success(f"Insumo '{nombre.strip()}' actualizado.")
+        else:
+            execute(
+                """
+                INSERT INTO insumos
+                    (nombre, descripcion, id_categoria, id_unidad_medida,
+                     stock_actual, stock_minimo, costo_unitario_referencia,
+                     activo)
+                VALUES (:n, :d, :c, :u, 0, :sm, :costo, :a)
+                """,
+                parametros,
+            )
+            st.success(f"Insumo '{nombre.strip()}' creado.")
+    except SQLAlchemyError as exc:
+        st.error(f"No se pudo guardar el insumo: {exc}")
+        return
+    st.rerun()
+
+
 def _render_gestion_mermas() -> None:
     requerir_accion("mermas.gestionar")
     # Convención sin cambiar el esquema: un reporte está pendiente mientras
@@ -331,9 +605,18 @@ def render():
     requerir_rol(ADMIN, GERENTE)
     st.subheader("📦 Inventario")
 
-    tab_stock, tab_ajuste, tab_mermas = st.tabs(
-        ["Existencias", "Registrar ajuste", "Gestión de Mermas"]
+    tab_critico, tab_stock, tab_insumos, tab_ajuste, tab_mermas = st.tabs(
+        [
+            "🚨 Stock Crítico",
+            "Existencias",
+            "Insumos",
+            "Registrar ajuste",
+            "Gestión de Mermas",
+        ]
     )
+
+    with tab_critico:
+        _render_stock_critico()
 
     with tab_stock:
         insumos = run_query(
@@ -364,6 +647,9 @@ def render():
                         use_container_width=True,
                         hide_index=True,
                     )
+
+    with tab_insumos:
+        _render_catalogo_insumos()
 
     with tab_ajuste:
         insumos_sel = run_query("SELECT id_insumo, nombre FROM insumos WHERE activo = TRUE ORDER BY nombre")

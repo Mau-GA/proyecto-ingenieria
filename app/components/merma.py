@@ -1,15 +1,20 @@
 """Control compartido para reportar la merma de un producto.
 
 Se usa tanto en Comandas (Cocina/Bar) como en Órdenes (Mesero/Caja/Gerente)
-para que el flujo sea idéntico: el usuario captura el motivo, confirma y el
-reporte aparece en la bandeja de Mermas del Gerente.
+para que el flujo sea idéntico: el usuario captura el motivo y elige entre
+dejar la partida tachada o repetirla en estado Pendiente. El reporte aparece
+en la bandeja de Mermas del Gerente.
 """
 import streamlit as st
 from sqlalchemy.exc import SQLAlchemyError
 
 from auth import usuario_actual
 from permissions import requerir_accion
-from services.mermas import MermaError, registrar_merma_detalle
+from services.mermas import (
+    MermaError,
+    registrar_merma_detalle,
+    repetir_detalle_mermado,
+)
 
 
 def render_boton_mermar(
@@ -20,7 +25,7 @@ def render_boton_mermar(
     etiqueta: str = "📉 Mermar",
     ayuda: str | None = None,
 ) -> None:
-    """Muestra el popover de captura y confirma la merma de una partida."""
+    """Muestra el popover para tachar la partida o tacharla y repetirla."""
     with st.popover(etiqueta, help=ayuda, use_container_width=True):
         motivo = st.text_input(
             "Motivo de la merma",
@@ -31,7 +36,7 @@ def render_boton_mermar(
         st.caption("El reporte se enviará a la bandeja de Mermas del Gerente.")
 
         if st.button(
-            "Confirmar merma",
+            "Mermar y dejar tachado",
             key=f"merma_confirmar_{clave}_{id_detalle}",
             type="primary",
             use_container_width=True,
@@ -51,3 +56,35 @@ def render_boton_mermar(
             else:
                 st.success("Merma reportada al Gerente.")
                 st.rerun()
+
+        if st.button(
+            "Mermar y repetir",
+            key=f"merma_repetir_{clave}_{id_detalle}",
+            use_container_width=True,
+        ):
+            requerir_accion("mermas.reportar")
+            auth = usuario_actual()
+            try:
+                registrar_merma_detalle(
+                    id_detalle=id_detalle,
+                    id_usuario=auth["id_usuario"],
+                    id_empleado=auth["id_empleado"],
+                    motivo=motivo,
+                    origen=origen,
+                    liberar_mesa_si_total=False,
+                )
+            except (MermaError, SQLAlchemyError) as exc:
+                st.error(f"No se pudo reportar la merma: {exc}")
+            else:
+                try:
+                    repetir_detalle_mermado(id_detalle=id_detalle)
+                except (MermaError, SQLAlchemyError) as exc:
+                    st.warning(
+                        "La merma se reportó, pero no se pudo repetir la "
+                        f"partida: {exc}"
+                    )
+                else:
+                    st.success(
+                        "Merma reportada y producto repetido en estado Pendiente."
+                    )
+                    st.rerun()

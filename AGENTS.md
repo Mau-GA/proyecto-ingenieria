@@ -8,7 +8,7 @@ Aplicación de restaurante (POS, mesas, órdenes, KDS, inventario, compras,
 usuarios y reportes) con:
 
 - **UI:** Streamlit (`app/app.py`)
-- **Datos:** MariaDB 11.4 + SQLAlchemy 2.x + PyMySQL (`app/database.py`)
+- **Datos:** PostgreSQL 16 + SQLAlchemy 2.x + psycopg2 (`app/database.py`)
 - **Auth:** bcrypt + sesión de Streamlit (`app/auth.py`)
 - **Autorización:** RBAC por roles (`app/permissions.py`)
 
@@ -30,6 +30,7 @@ app/
   services/mermas.py     # mermas de producto/partida -> movimientos + mermas
   set_admin_password.py  # regenera el hash bcrypt del usuario admin
   crear_usuarios_prueba.py # crea/actualiza cuentas de prueba por rol
+  actualizar_unidades_inventario.py # migra alitas/refrescos a piezas
 db/
   schema.sql             # DDL normalizado (3FN)
   seed.sql               # catálogos, empleados y datos históricos
@@ -51,6 +52,7 @@ docker compose logs -f app
 # Ejecutar utilidades dentro del contenedor
 docker compose exec app python set_admin_password.py
 docker compose exec app python crear_usuarios_prueba.py
+docker compose exec app python actualizar_unidades_inventario.py
 
 # Re-inicializar la BD desde cero (BORRA DATOS)
 docker compose down -v && docker compose up -d
@@ -83,8 +85,17 @@ por lo que Streamlit recarga al guardar cambios.
   `Listo` o `Entregado` (validado en UI y en `cobrar_orden_mesa`). No existe un
   estado `Mermado` en el esquema: la merma se marca en `auditoria` y esas
   partidas se excluyen del cobro.
-- El número visible de orden/turno se calcula por `DATE(fecha_orden)` y
-  reinicia a 1 cada día; no se guarda una columna extra.
+- Si todas las partidas activas de una orden quedan mermadas,
+  `registrar_merma_detalle` cancela la orden y libera su mesa (si tiene),
+  dejándola en `Disponible`. La excepción es "Mermar y repetir", que conserva
+  la mesa ocupada porque inserta una reposición en la misma orden.
+- Las mesas solo admiten los estados `Disponible` y `Ocupada`.
+- En Comandas > Listo, el Gerente puede pulsar "Limpiar sección" para pasar
+  todas las partidas `Listo` a `Entregado`; la acción `comandas.limpiar` es
+  exclusiva del rol Gerente.
+- El número visible de orden se guarda en `ordenes.numero_orden_diaria` y se
+  asigna al crear la orden con `MAX(...) + 1` del `CURRENT_DATE`; reinicia a 1
+  cada día. El `id_orden` queda solo para relaciones internas.
 - Las mermas se reportan sin tocar stock. "Subir merma" en Inventario descuenta
   formalmente el inventario y fija `costo_estimado_perdida`.
 - El formulario de Mermas usa un selector combinado `[Menú]` / `[Insumo]` con
@@ -93,6 +104,15 @@ por lo que Streamlit recarga al guardar cambios.
   receta); insumo base -> `registrar_merma_insumo` (movimiento directo). El
   Gerente distingue el tipo por el prefijo del motivo (`Merma producto` vs
   `Merma insumo`) y la bandeja muestra "Producto preparado" o "Insumo base".
+- Inventario tiene una pestaña `Stock Crítico` que lista solo insumos activos
+  con `stock_actual <= stock_minimo`, ordenados por faltante.
+- La pestaña `Insumos` permite alta/edición de insumos. Los nombres que
+  contengan alita, coca, refresco o soda se guardan siempre con unidad
+  `Pieza (pza)`; el stock actual solo se modifica desde `Registrar ajuste`.
+- `Alitas Pollo` y `Refresco Cola` se manejan por pieza. La conversión usada
+  es 1 kg = 20 alitas y 1 refresco = 0.6 l. El script
+  `actualizar_unidades_inventario.py` es idempotente y ajusta stock, mínimos,
+  costos, recetas, movimientos y compras históricas.
 
 ## Cuentas de prueba
 

@@ -56,12 +56,7 @@ def _orden_abierta_de_mesa(id_mesa: int):
     df = run_query(
         """
         SELECT o.id_orden, o.id_mesa, o.total,
-               (
-                   SELECT COUNT(*)
-                   FROM ordenes o2
-                   WHERE DATE(o2.fecha_orden) = DATE(o.fecha_orden)
-                     AND o2.id_orden <= o.id_orden
-               ) AS numero_dia
+               o.numero_orden_diaria AS numero_dia
         FROM ordenes o
         JOIN estados_orden e ON e.id_estado = o.id_estado
         WHERE o.id_mesa = :id_mesa AND e.es_final = FALSE
@@ -79,7 +74,7 @@ def _detalles_orden(id_orden: int):
         SELECT d.id_detalle, d.cantidad, p.nombre AS producto,
                d.precio_unitario, d.subtotal, ed.nombre AS estado_detalle,
                (
-                   SELECT JSON_UNQUOTE(JSON_EXTRACT(a.datos_nuevos, '$.comentario'))
+                   SELECT a.datos_nuevos ->> 'comentario'
                    FROM auditoria a
                    WHERE a.tabla_afectada = 'detalles_orden_comentario'
                      AND a.id_registro_afectado = d.id_detalle
@@ -87,7 +82,7 @@ def _detalles_orden(id_orden: int):
                    LIMIT 1
                ) AS comentario,
                (
-                   SELECT JSON_UNQUOTE(JSON_EXTRACT(a.datos_nuevos, '$.motivo'))
+                   SELECT a.datos_nuevos ->> 'motivo'
                    FROM auditoria a
                    WHERE a.tabla_afectada = 'detalles_orden_merma'
                      AND a.id_registro_afectado = d.id_detalle
@@ -290,7 +285,7 @@ def _render_constructor_orden(id_mesa: int):
                 st.error(f"No se guardó la orden: {exc}")
                 return
             st.session_state["carrito"] = []
-            st.success(f"Turno #{resultado['numero_dia']} actualizado correctamente.")
+            st.success(f"Orden #{resultado['numero_dia']} actualizado correctamente.")
             st.rerun()
 
 
@@ -298,7 +293,7 @@ def _render_cobro(orden, id_mesa: int | None) -> None:
     """Calculadora de efectivo y cobro integrados en la tarjeta de la orden."""
     requerir_accion("ordenes.cobrar")
     id_orden = int(orden["id_orden"])
-    turno = int(orden["numero_dia"])
+    numero_orden = int(orden["numero_dia"])
     total = float(orden["total"])
     if total <= 0:
         st.info(
@@ -375,9 +370,9 @@ def _render_cobro(orden, id_mesa: int | None) -> None:
             return
         if id_mesa is not None:
             st.session_state.pop("mesa_seleccionada", None)
-            st.success(f"Turno #{turno} cobrado. Mesa liberada.")
+            st.success(f"Orden #{numero_orden} cobrado. Mesa liberada.")
         else:
-            st.success(f"Turno #{turno} cobrado.")
+            st.success(f"Orden #{numero_orden} cobrado.")
         st.rerun()
 
 
@@ -392,14 +387,9 @@ def _render_cuentas_abiertas(
     abiertas = run_query(
         """
         SELECT o.id_orden, o.id_mesa, o.total, o.fecha_orden,
+               o.numero_orden_diaria AS numero_dia,
                m.numero_mesa, t.nombre AS tipo, e.nombre AS estado,
-               pe.nombre AS plataforma, o.referencia_externa,
-               (
-                   SELECT COUNT(*)
-                   FROM ordenes o2
-                   WHERE DATE(o2.fecha_orden) = DATE(o.fecha_orden)
-                     AND o2.id_orden <= o.id_orden
-               ) AS numero_dia
+               pe.nombre AS plataforma, o.referencia_externa
         FROM ordenes o
         JOIN estados_orden e ON e.id_estado = o.id_estado
         JOIN tipos_orden t ON t.id_tipo_orden = o.id_tipo_orden
@@ -424,7 +414,7 @@ def _render_cuentas_abiertas(
 
     for _, orden in abiertas.iterrows():
         id_orden = int(orden["id_orden"])
-        turno = int(orden["numero_dia"])
+        numero_orden = int(orden["numero_dia"])
         total = float(orden["total"])
         id_mesa = None
         if _texto(orden["id_mesa"]):
@@ -442,7 +432,7 @@ def _render_cuentas_abiertas(
 
         with st.container(border=True):
             c1, c2, c3, c4 = st.columns([2, 2, 3, 1])
-            c1.markdown(f"**Turno #{turno}**")
+            c1.markdown(f"**Orden #{numero_orden}**")
             c2.markdown(str(orden["tipo"]))
             c3.markdown(ubicacion)
             c4.markdown(f"**${total:.2f}**")
@@ -450,7 +440,7 @@ def _render_cuentas_abiertas(
             etiqueta = "Abrir cuenta / cobrar" if puede_cobrar else "Ver comanda"
             with st.expander(etiqueta):
                 st.markdown(
-                    f"#### Turno #{turno} — Total: ${total:.2f}"
+                    f"#### Orden #{numero_orden} — Total: ${total:.2f}"
                 )
                 _render_detalles(id_orden, permitir_eliminar=permitir_eliminar)
                 if puede_cobrar:
@@ -474,9 +464,9 @@ def _render_tab_mesas(*, puede_crear: bool, puede_cobrar: bool) -> None:
             orden = _orden_abierta_de_mesa(id_mesa)
             _render_constructor_orden(id_mesa)
             if orden is not None:
-                turno = int(orden["numero_dia"])
+                numero_orden = int(orden["numero_dia"])
                 st.markdown(
-                    f"#### Cuenta abierta — Turno #{turno} — "
+                    f"#### Cuenta abierta — Orden #{numero_orden} — "
                     f"Total: ${float(orden['total']):.2f}"
                 )
                 _render_detalles(

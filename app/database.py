@@ -1,7 +1,7 @@
 """
 Ruta: proyectorestaurante/app/database.py
 
-Capa de acceso a datos con SQLAlchemy 2.x + PyMySQL.
+Capa de acceso a datos con SQLAlchemy 2.x + psycopg2 (PostgreSQL).
 
 - Lee la conexión de variables de entorno (inyectadas por docker-compose.yml,
   o desde un archivo .env en desarrollo local gracias a python-dotenv).
@@ -55,13 +55,12 @@ def construir_url() -> URL:
     f-string NO hace y que rompe la conexión de forma confusa.
     """
     return URL.create(
-        drivername="mysql+pymysql",
+        drivername="postgresql+psycopg2",
         username=_env("MYSQL_USER"),
         password=_env("MYSQL_PASSWORD"),
         host=_env("MYSQL_HOST", "db"),          # nombre del servicio en Docker
-        port=int(_env("MYSQL_PORT", "3306")),
+        port=int(_env("MYSQL_PORT", "5432")),
         database=_env("MYSQL_DATABASE"),
-        query={"charset": "utf8mb4"},
     )
 
 
@@ -86,7 +85,7 @@ def verificar_conexion() -> tuple[bool, str]:
     try:
         with get_engine().connect() as conn:
             version = conn.execute(text("SELECT VERSION()")).scalar_one()
-        return True, f"Conectado a MariaDB {version}"
+        return True, f"Conectado a PostgreSQL {version}"
     except (SQLAlchemyError, RuntimeError) as exc:
         return False, f"{type(exc).__name__}: {exc}"
 
@@ -103,11 +102,15 @@ def run_query(sql: str, params: dict | None = None) -> pd.DataFrame:
 def execute(sql: str, params: dict | None = None) -> int:
     """
     INSERT/UPDATE/DELETE en su propia transacción (commit automático).
-    Regresa lastrowid (id autogenerado en INSERT; 0 en UPDATE/DELETE).
+    Regresa el id autogenerado cuando el INSERT incluye RETURNING; en
+    cualquier otro caso regresa 0 (PostgreSQL no expone lastrowid).
     """
     with get_engine().begin() as conn:
         result = conn.execute(text(sql), params or {})
-        return result.lastrowid
+        if result.returns_rows:
+            valor = result.scalar()
+            return int(valor) if valor is not None else 0
+        return 0
 
 
 def execute_many(sql: str, params_list: list[dict]) -> None:

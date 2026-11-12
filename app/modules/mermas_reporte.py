@@ -190,17 +190,17 @@ def render() -> None:
     reportes = run_query(
         """
         SELECT CASE
-                   WHEN mi.motivo LIKE CONCAT(:prefijo_producto, '%')
+                   WHEN mi.motivo ILIKE CONCAT(:prefijo_producto, '%')
                        THEN 'Producto preparado'
-                   WHEN mi.motivo LIKE CONCAT(:prefijo_insumo, '%')
+                   WHEN mi.motivo ILIKE CONCAT(:prefijo_insumo, '%')
                        THEN 'Insumo base'
                    ELSE 'Insumo base'
                END AS tipo,
                m.descripcion AS reporte,
                mi.fecha_movimiento AS fecha,
-               GROUP_CONCAT(
-                   CONCAT(i.nombre, ': ', FORMAT(mi.cantidad, 3), ' ', um.abreviatura)
-                   SEPARATOR ' · '
+               STRING_AGG(
+                   CONCAT(i.nombre, ': ', TO_CHAR(mi.cantidad, 'FM999999999990.000'), ' ', um.abreviatura),
+                   ' · ' ORDER BY i.nombre
                ) AS insumos,
                CASE
                    WHEN MIN(m.costo_estimado_perdida) IS NULL THEN 'Pendiente'

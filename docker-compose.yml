@@ -8,38 +8,33 @@ name: proyectorestaurante
 
 services:
   # -------------------------------------------------------------------
-  # Base de datos MariaDB
+  # Base de datos PostgreSQL 16
   # -------------------------------------------------------------------
   db:
-    image: mariadb:11.4                # LTS; fija la versión menor para builds reproducibles
+    image: postgres:16
     container_name: restaurante_db
     restart: unless-stopped
-    command:
-      # Fuerza utf8mb4 a nivel servidor (acentos, ñ, emojis) igual que schema.sql
-      - --character-set-server=utf8mb4
-      - --collation-server=utf8mb4_unicode_ci
     environment:
-      # ${VAR:?msg} hace que `docker compose up` falle con un mensaje claro
-      # si la variable no existe en .env, en vez de arrancar sin contraseña.
-      MARIADB_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Define MYSQL_ROOT_PASSWORD en .env}
-      MARIADB_DATABASE: ${MYSQL_DATABASE:?Define MYSQL_DATABASE en .env}
-      MARIADB_USER: ${MYSQL_USER:?Define MYSQL_USER en .env}
-      MARIADB_PASSWORD: ${MYSQL_PASSWORD:?Define MYSQL_PASSWORD en .env}
+      # Se reutilizan las variables MYSQL_* de .env para no exponer
+      # credenciales nuevas; PostgreSQL las recibe con sus nombres nativos.
+      POSTGRES_DB: ${MYSQL_DATABASE:?Define MYSQL_DATABASE en .env}
+      POSTGRES_USER: ${MYSQL_USER:?Define MYSQL_USER en .env}
+      POSTGRES_PASSWORD: ${MYSQL_PASSWORD:?Define MYSQL_PASSWORD en .env}
       TZ: ${TZ:-America/Mexico_City}
     ports:
-      # Solo escucha en localhost del HOST (DBeaver/Workbench locales).
-      # Entre contenedores la app SIEMPRE usa db:3306 por la red interna.
-      - "127.0.0.1:${MYSQL_EXPOSED_PORT:-3307}:3306"
+      # Solo escucha en localhost del HOST (DBeaver/psql locales).
+      # Entre contenedores la app SIEMPRE usa db:5432 por la red interna.
+      - "127.0.0.1:${MYSQL_EXPOSED_PORT:-3307}:5432"
     volumes:
-      - mariadb_data:/var/lib/mysql
+      - postgres_data:/var/lib/postgresql/data
       # Scripts de inicialización: se ejecutan en orden alfabético SOLO
-      # cuando el volumen mariadb_data está vacío (primer arranque).
+      # cuando el volumen postgres_data está vacío (primer arranque).
       # Para re-ejecutarlos: docker compose down -v && docker compose up -d
       - ./db/schema.sql:/docker-entrypoint-initdb.d/1_schema.sql:ro
       - ./db/seed.sql:/docker-entrypoint-initdb.d/2_seed.sql:ro
     healthcheck:
-      # Script incluido en la imagen oficial de MariaDB
-      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      # pg_isready viene incluido en la imagen oficial de PostgreSQL.
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -58,11 +53,11 @@ services:
     restart: unless-stopped
     depends_on:
       db:
-        condition: service_healthy    # no arranca hasta que MariaDB acepte conexiones
+        condition: service_healthy    # no arranca hasta que PostgreSQL acepte conexiones
     environment:
       # Host = nombre del servicio en la red de Docker, NUNCA "localhost"
       MYSQL_HOST: db
-      MYSQL_PORT: 3306
+      MYSQL_PORT: 5432
       MYSQL_DATABASE: ${MYSQL_DATABASE}
       MYSQL_USER: ${MYSQL_USER}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD}
@@ -94,4 +89,4 @@ networks:
     driver: bridge
 
 volumes:
-  mariadb_data:
+  postgres_data:

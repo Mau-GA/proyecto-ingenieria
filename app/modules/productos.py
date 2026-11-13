@@ -1,5 +1,6 @@
 """Módulo de Productos y Categorías (catálogo del menú)."""
 import streamlit as st
+from sqlalchemy.exc import IntegrityError
 
 from database import run_query, execute
 from permissions import requerir_rol, requerir_accion, ADMIN, GERENTE
@@ -45,13 +46,17 @@ def render():
             if not nombre.strip():
                 st.error("El nombre es obligatorio.")
             else:
-                execute(
-                    """
-                    INSERT INTO productos (nombre, id_categoria, id_area_preparacion, precio_actual, disponible)
-                    VALUES (:n, :c, :a, :p, :d)
-                    """,
-                    {"n": nombre.strip(), "c": int(categoria["id_categoria"]), "a": int(area["id_area"]),
-                     "p": precio, "d": disponible},
-                )
-                st.success(f"Producto '{nombre}' creado.")
-                st.rerun()
+                try:
+                    execute(
+                        """
+                        INSERT INTO productos (nombre, id_categoria, id_area_preparacion, precio_actual, disponible)
+                        VALUES (:n, :c, :a, :p, :d)
+                        """,
+                        {"n": nombre.strip(), "c": int(categoria["id_categoria"]), "a": int(area["id_area"]),
+                         "p": precio, "d": disponible},
+                    )
+                except IntegrityError:
+                    st.error("Ya existe un producto con ese nombre.")
+                else:
+                    st.success(f"Producto '{nombre}' creado.")
+                    st.rerun()

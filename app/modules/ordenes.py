@@ -198,6 +198,23 @@ def _render_detalles(
                     st.rerun()
 
 
+def _agregar_producto_orden(
+    producto_sel: dict, cantidad: int, comentario: str
+) -> None:
+    """Callback: agrega al carrito y limpia la nota para el siguiente producto."""
+    st.session_state.setdefault("carrito", []).append(
+        {
+            "id_producto": int(producto_sel["id_producto"]),
+            "nombre": producto_sel["nombre"],
+            "cantidad": int(cantidad),
+            "precio": float(producto_sel["precio_actual"]),
+            "id_area_preparacion": int(producto_sel["id_area_preparacion"]),
+            "comentario": comentario.strip(),
+        }
+    )
+    st.session_state["orden_comentario"] = ""
+
+
 def _render_constructor_orden(id_mesa: int):
     requerir_accion("ordenes.crear")
     mesa = run_query(
@@ -238,13 +255,11 @@ def _render_constructor_orden(id_mesa: int):
         key="orden_comentario",
     )
 
-    if st.button("➕ Agregar producto"):
-        carrito.append({
-            "id_producto": int(producto_sel["id_producto"]), "nombre": producto_sel["nombre"],
-            "cantidad": int(cantidad), "precio": float(producto_sel["precio_actual"]),
-            "id_area_preparacion": int(producto_sel["id_area_preparacion"]),
-            "comentario": comentario.strip(),
-        })
+    st.button(
+        "➕ Agregar producto",
+        on_click=_agregar_producto_orden,
+        args=(producto_sel, int(cantidad), comentario),
+    )
 
     if carrito:
         st.markdown("#### Carrito")
@@ -370,7 +385,17 @@ def _render_cobro(orden, id_mesa: int | None) -> None:
             return
         if id_mesa is not None:
             st.session_state.pop("mesa_seleccionada", None)
-            st.success(f"Orden #{numero_orden} cobrado. Mesa liberada.")
+            estado_mesa = run_query(
+                "SELECT estado FROM mesas WHERE id_mesa = :m",
+                {"m": id_mesa},
+            )
+            if not estado_mesa.empty and estado_mesa.iloc[0]["estado"] == "Disponible":
+                st.success(f"Orden #{numero_orden} cobrado. Mesa liberada.")
+            else:
+                st.success(
+                    f"Orden #{numero_orden} cobrado. La mesa sigue ocupada "
+                    "por otra cuenta abierta."
+                )
         else:
             st.success(f"Orden #{numero_orden} cobrado.")
         st.rerun()

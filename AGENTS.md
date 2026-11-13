@@ -27,7 +27,7 @@ app/
   modules/               # foodhouse, mesas, ordenes, comandas, mermas_reporte,
                          # productos, inventario, compras, usuarios, reportes
   services/ventas.py     # lógica de ventas
-  services/mermas.py     # mermas de producto/partida -> movimientos + mermas
+  services/mermas.py     # mermas pendientes en auditoría -> movimientos al subir
   set_admin_password.py  # regenera el hash bcrypt del usuario admin
   crear_usuarios_prueba.py # crea/actualiza cuentas de prueba por rol
   actualizar_unidades_inventario.py # migra alitas/refrescos a piezas
@@ -59,10 +59,13 @@ docker compose down -v && docker compose up -d
 
 # Verificar sintaxis sin dependencias instaladas en el host
 python3 -m py_compile app/*.py app/modules/*.py app/components/*.py app/services/*.py
+
+# Pruebas (crean/recargan una BD *_test; no tocan la principal)
+docker compose run --rm -v "$PWD/tests:/app/tests" -v "$PWD/db:/app/db" app pytest -q /app/tests
 ```
 
-No hay suite de tests automatizada. La app se monta con bind mount (`./app:/app`),
-por lo que Streamlit recarga al guardar cambios.
+La app se monta con bind mount (`./app:/app`), por lo que Streamlit recarga al
+guardar cambios.
 
 ## Base de datos y reglas clave
 
@@ -89,21 +92,36 @@ por lo que Streamlit recarga al guardar cambios.
   `registrar_merma_detalle` cancela la orden y libera su mesa (si tiene),
   dejándola en `Disponible`. La excepción es "Mermar y repetir", que conserva
   la mesa ocupada porque inserta una reposición en la misma orden.
-- Las mesas solo admiten los estados `Disponible` y `Ocupada`.
+- Las mesas solo admiten los estados `Disponible` y `Ocupada`. Cobrar libera la
+  mesa solo si no quedan otras órdenes no finales; continuar una cuenta la deja
+  `Ocupada`. `cobrar_orden_mesa` bloquea la orden con `FOR UPDATE` y rechaza
+  estados finales para impedir un segundo pago.
+- Los ajustes negativos validan el stock con `FOR UPDATE` y no insertan
+  movimiento si la cantidad supera lo disponible.
+- Los formularios de alta muestran mensajes amigables ante nombres duplicados
+  (`productos`, `usuarios`) y Streamlit oculta trazas con
+  `showErrorDetails = false`.
 - En Comandas > Listo, el Gerente puede pulsar "Limpiar sección" para pasar
   todas las partidas `Listo` a `Entregado`; la acción `comandas.limpiar` es
   exclusiva del rol Gerente.
 - El número visible de orden se guarda en `ordenes.numero_orden_diaria` y se
   asigna al crear la orden con `MAX(...) + 1` del `CURRENT_DATE`; reinicia a 1
   cada día. El `id_orden` queda solo para relaciones internas.
-- Las mermas se reportan sin tocar stock. "Subir merma" en Inventario descuenta
-  formalmente el inventario y fija `costo_estimado_perdida`.
+- Las mermas se reportan sin tocar stock: `mermas.id_movimiento` queda NULL y
+  los datos del insumo/cantidad se guardan en `auditoria`
+  (`tabla_afectada = 'mermas_pendientes'`). Al subirlas, una partida ya vendida
+  solo registra `costo_estimado_perdida` (la venta ya descontó receta); una
+  captura manual inserta el movimiento `Merma` y descuenta stock en ese momento.
+- `registrar_merma_detalle(..., repetir=True)` hace merma + reposición en UNA
+  transacción y descuenta la receta de la reposición; si no alcanza stock, no
+  queda ni la merma. El rechazo se bloquea si existe auditoría
+  `detalles_orden_reposicion`.
 - El formulario de Mermas usa un selector combinado `[Menú]` / `[Insumo]` con
   todos los productos e insumos activos. Producto preparado ->
-  `registrar_merma_producto` (un movimiento por insumo de receta; requiere
-  receta); insumo base -> `registrar_merma_insumo` (movimiento directo). El
-  Gerente distingue el tipo por el prefijo del motivo (`Merma producto` vs
-  `Merma insumo`) y la bandeja muestra "Producto preparado" o "Insumo base".
+  `registrar_merma_producto` (una merma pendiente por insumo de receta;
+  requiere receta); insumo base -> `registrar_merma_insumo` (merma pendiente
+  directa). La bandeja agrupa por el token `reporte` de auditoría y muestra
+  "Producto preparado" o "Insumo base".
 - Inventario tiene una pestaña `Stock Crítico` que lista solo insumos activos
   con `stock_actual <= stock_minimo`, ordenados por faltante.
 - La pestaña `Insumos` permite alta/edición de insumos. Los nombres que

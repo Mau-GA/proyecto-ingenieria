@@ -1,7 +1,7 @@
 # Los Bro's Restaurant — Sistema web de administración
 
 Proyecto para el equipo **Axon Analytics**: convierte la base de datos del
-restaurante en un sistema web funcional con Streamlit + MariaDB + Docker.
+restaurante en un sistema web funcional con Streamlit + PostgreSQL + Docker.
 
 > **¿Solo quieres levantarlo?** Sigue [`PASOS.md`](PASOS.md): instalación,
 > compilación con `docker compose up -d --build`, verificación y solución de
@@ -28,8 +28,8 @@ restaurante en un sistema web funcional con Streamlit + MariaDB + Docker.
   agrega `transaccion()` y `verificar_conexion()`.
 - `auth.py`: corregido el caso de usuario sin empleado (pandas entrega `NaN`,
   no `None`, para un `id_empleado` nulo).
-- Docker: healthcheck con Python (la imagen slim no trae `curl`), MariaDB
-  11.4 con utf8mb4 forzado, puerto de BD solo en `127.0.0.1`, validación de
+- Docker: healthcheck con Python (la imagen slim no trae `curl`), PostgreSQL
+  16 con UTF8/citext, puerto de BD solo en `127.0.0.1`, validación de
   variables obligatorias del `.env`.
 
 ---
@@ -41,9 +41,8 @@ restaurante en un sistema web funcional con Streamlit + MariaDB + Docker.
 Los archivos **ya son un rediseño normalizado a 3FN** de un dump original
 (`proyectorestaurante.sql`):
 
-- **Motor:** MariaDB/MySQL. Usa `AUTO_INCREMENT`, `ENGINE=InnoDB`,
-  `ENUM`, columnas generadas (`GENERATED ALWAYS AS (...) STORED`) y `JSON`
-  para auditoría — todas características nativas de este motor.
+- **Motor:** PostgreSQL 16. Usa columnas `IDENTITY`, `CITEXT`, columnas
+  generadas (`GENERATED ALWAYS AS (...) STORED`) y `JSONB` para auditoría.
 - **Catálogos en vez de VARCHAR libres:** roles, permisos, puestos,
   unidades de medida, métodos de pago, estados de orden/detalle, tipos de
   orden, plataformas externas, tipos de movimiento de inventario. Esto evita
@@ -51,21 +50,21 @@ Los archivos **ya son un rediseño normalizado a 3FN** de un dump original
 - **Separación usuarios/empleados:** un empleado puede no tener cuenta de
   acceso, y una cuenta administrativa puede no tener ficha laboral. Lo
   respeta el código (ver sección 10).
-- **Inventario vía tabla satélite `mermas`:** toda merma primero genera un
-  movimiento de salida en `movimientos_inventario`; `mermas` solo añade el
-  detalle investigativo.
-- **Advertencias ya documentadas en el propio seed:** los totales originales
-  de 17 de 18 órdenes no cuadraban con la suma de sus partidas y se
-  recalcularon; la orden 18 no tiene partidas; los montos de `pagos` parecen
-  desfasados una posición respecto a `id_orden`. Son datos de prueba; no los
-  uses para conciliación financiera real sin revisarlos.
+- **Mermas en dos fases:** al reportar se crea la fila en `mermas` con
+  `id_movimiento = NULL` y una marca JSON en `auditoria`; el stock no cambia.
+  Al subirla, una partida ya vendida solo registra el costo (la venta ya
+  descontó receta) y una captura manual crea el movimiento `Merma` y descuenta
+  stock en ese momento.
+- **Seed consistente:** las órdenes históricas quedan `Pagada` o `Cancelada`,
+  sus partidas `Entregado`, los totales coinciden con la suma de partidas y
+  pagos, y todas las mesas inician `Disponible`. La orden 18, sin partidas,
+  queda cancelada con total 0.
 
-### 1.2 ¿MariaDB o PostgreSQL?
+### 1.2 ¿Por qué PostgreSQL?
 
-**MariaDB.** El schema usa características específicas de MySQL/MariaDB
-(`ENGINE=InnoDB`, `ENUM`, `AUTO_INCREMENT`, columnas `GENERATED ... STORED`
-con esa sintaxis). Migrar a PostgreSQL implicaría reescribir buena parte de
-`schema.sql` sin ganancia funcional para este proyecto.
+**PostgreSQL 16.** El schema usa `IDENTITY`, `CITEXT`, columnas generadas,
+`JSONB`, índices sobre expresiones e integridad referencial estricta. La app se
+conecta con SQLAlchemy + `psycopg2`; los scripts de `db/` se cargan con `psql`.
 
 ### 1.3 Interfaz de referencia ("POSFood")
 
@@ -80,7 +79,7 @@ oscuro, acento rojo/naranja, tarjetas redondeadas) con `st.columns`,
 ## 2. Arquitectura
 
 ```
-Navegador ──▶ Streamlit (contenedor "app")  ──▶ MariaDB (contenedor "db")
+Navegador ──▶ Streamlit (contenedor "app")  ──▶ PostgreSQL (contenedor "db")
                      ▲                                 ▲
                      │                                 │
               docker-compose.yml conecta ambos     DBeaver (desde tu
@@ -96,10 +95,10 @@ app.py ─▶ components/sidebar.py ─▶ modules/*.py (interfaz por módulo)
                                services/ventas.py (reglas de negocio, transacciones)
                                         │
                                         ▼
-                                  database.py (SQLAlchemy + PyMySQL)
+                                  database.py (SQLAlchemy + psycopg2)
 ```
 
-- **SQLAlchemy + PyMySQL**, siempre con parámetros nombrados (nunca
+- **SQLAlchemy + psycopg2**, siempre con parámetros nombrados (nunca
   f-strings en SQL) para evitar inyección SQL.
 - **bcrypt** para contraseñas.
 - **Docker Compose** con dos servicios en una red interna; el código de la
@@ -165,7 +164,7 @@ docker compose exec app python set_admin_password.py
 
 | Desde...                      | Host        | Puerto                                 |
 |-------------------------------|-------------|----------------------------------------|
-| Streamlit (dentro de Docker)  | `db`        | `3306`                                 |
+| Streamlit (dentro de Docker)  | `db`        | `5432`                                 |
 | DBeaver / app sin Docker      | `127.0.0.1` | `MYSQL_EXPOSED_PORT` (por defecto 3307)|
 
 ### Git y GitHub
@@ -222,9 +221,13 @@ hacia `main`. **Nunca subir `.env`** (ya está en `.gitignore`).
   orden” lleva a Órdenes con esa mesa seleccionada.
 - **Órdenes:** cuenta abierta por mesa; al guardar crea la orden (o
   reutiliza la abierta), inserta partidas, **descuenta inventario** y marca
-  la mesa *Ocupada*. “Cobrar y cerrar mesa” registra el pago y la libera.
+  la mesa *Ocupada*. “Cobrar y cerrar mesa” registra el pago y libera la mesa
+  solo si no quedan otras cuentas abiertas en ella.
 - **Productos:** catálogo con categoría, área de preparación y precio.
-- **Inventario:** existencias con alerta de stock mínimo y ajustes manuales.
+- **Inventario:** existencias con alerta de stock mínimo, ajustes manuales
+  atómicos y bandeja de mermas pendientes. “Subir merma” confirma el costo;
+  solo las capturas manuales descuentan stock (las partidas vendidas ya lo
+  hicieron al cobrar).
 - **Compras:** compras a proveedor; cada partida suma al stock.
 - **Usuarios** (solo Administrador): usuarios, roles y empleados.
 - **Reportes:** total cobrado, desglose por método de pago, productos más
@@ -245,6 +248,14 @@ hacia `main`. **Nunca subir `.env`** (ya está en `.gitignore`).
 ---
 
 ## 12. Guía de pruebas
+
+Pruebas automatizadas (crean y recargan una base `*_test`):
+
+```bash
+docker compose run --rm -v "$PWD/tests:/app/tests" -v "$PWD/db:/app/db" app pytest -q /app/tests
+```
+
+Pruebas manuales:
 
 1. Levanta el proyecto y fija la contraseña de `admin` (PASOS 4–6).
 2. Inicia sesión: debes ver los 8 módulos, empezando por Punto de venta.

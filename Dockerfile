@@ -9,9 +9,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# PyMySQL es Python puro: no se necesitan compiladores ni librerías del sistema.
-# Se copia primero requirements.txt para aprovechar la caché de capas de Docker
-# (solo se reinstala si cambian las dependencias).
+# psycopg2-binary trae el driver ya compilado: no se necesitan compiladores
+# ni librerías del sistema. Se copia primero requirements.txt para aprovechar
+# la caché de capas de Docker (solo se reinstala si cambian las dependencias).
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 

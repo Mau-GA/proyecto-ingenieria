@@ -608,10 +608,15 @@ def guardar_orden_mesa(
             fila_orden = res.mappings().one()
             id_orden = int(fila_orden["id_orden"])
             numero_dia = int(fila_orden["numero_orden_diaria"])
-            conn.execute(text("UPDATE mesas SET estado = 'Ocupada' WHERE id_mesa = :m"), {"m": id_mesa})
         else:
             id_orden = int(existente["id_orden"])
             numero_dia = int(existente["numero_orden_diaria"])
+
+        # La mesa debe quedar ocupada también al continuar una cuenta existente.
+        conn.execute(
+            text("UPDATE mesas SET estado = 'Ocupada' WHERE id_mesa = :m"),
+            {"m": id_mesa},
+        )
 
         total, resumen = agregar_partidas(
             conn, id_orden=id_orden, partidas=partidas, id_empleado=id_empleado,
@@ -723,10 +728,24 @@ def cobrar_orden_mesa(*, id_orden: int, id_mesa: int | None, id_metodo_pago: int
                       id_usuario: int, referencia_pago: str | None = None) -> Decimal:
     """Cobra una cuenta abierta: pago + orden 'Pagada' + mesa 'Disponible' (atómico)."""
     with transaccion() as conn:
-        total = conn.execute(
-            text("SELECT total FROM ordenes WHERE id_orden = :o FOR UPDATE"), {"o": id_orden}
-        ).scalar_one()
-        total = dinero(total)
+        orden = conn.execute(
+            text(
+                """
+                SELECT o.total, e.es_final
+                FROM ordenes o
+                JOIN estados_orden e ON e.id_estado = o.id_estado
+                WHERE o.id_orden = :o
+                FOR UPDATE OF o
+                """
+            ),
+            {"o": id_orden},
+        ).mappings().first()
+        if orden is None:
+            raise VentaError("La orden no existe.")
+        if bool(orden["es_final"]):
+            raise VentaError("La orden ya fue cobrada o cancelada.")
+
+        total = dinero(orden["total"])
         if total <= 0:
             raise VentaError("La orden no tiene importe que cobrar.")
         bloqueantes = int(
@@ -770,6 +789,23 @@ def cobrar_orden_mesa(*, id_orden: int, id_mesa: int | None, id_metodo_pago: int
         conn.execute(text("UPDATE ordenes SET id_estado = :e WHERE id_orden = :o"),
                      {"e": id_pagada, "o": id_orden})
         if id_mesa is not None:
-            conn.execute(text("UPDATE mesas SET estado = 'Disponible' WHERE id_mesa = :m"),
-                         {"m": id_mesa})
+            # La mesa solo se libera cuando ya no tiene otras cuentas abiertas.
+            conn.execute(
+                text(
+                    """
+                    UPDATE mesas
+                    SET estado = 'Disponible'
+                    WHERE id_mesa = :m
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM ordenes o
+                          JOIN estados_orden e ON e.id_estado = o.id_estado
+                          WHERE o.id_mesa = mesas.id_mesa
+                            AND o.id_orden <> :orden
+                            AND e.es_final = FALSE
+                      )
+                    """
+                ),
+                {"m": id_mesa, "orden": id_orden},
+            )
     return total

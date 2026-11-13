@@ -10,11 +10,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from auth import usuario_actual
 from permissions import requerir_accion
-from services.mermas import (
-    MermaError,
-    registrar_merma_detalle,
-    repetir_detalle_mermado,
-)
+from services.mermas import MermaError, registrar_merma_detalle
 
 
 def render_boton_mermar(
@@ -72,19 +68,12 @@ def render_boton_mermar(
                     motivo=motivo,
                     origen=origen,
                     liberar_mesa_si_total=False,
+                    repetir=True,
                 )
             except (MermaError, SQLAlchemyError) as exc:
                 st.error(f"No se pudo reportar la merma: {exc}")
             else:
-                try:
-                    repetir_detalle_mermado(id_detalle=id_detalle)
-                except (MermaError, SQLAlchemyError) as exc:
-                    st.warning(
-                        "La merma se reportó, pero no se pudo repetir la "
-                        f"partida: {exc}"
-                    )
-                else:
-                    st.success(
-                        "Merma reportada y producto repetido en estado Pendiente."
-                    )
-                    st.rerun()
+                st.success(
+                    "Merma reportada y producto repetido en estado Pendiente."
+                )
+                st.rerun()

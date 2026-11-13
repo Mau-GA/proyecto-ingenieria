@@ -6,9 +6,12 @@ streamlit==1.38.0
 
 # --- Acceso a datos ---
 SQLAlchemy==2.0.32
-psycopg2-binary==2.9.9   # Driver de PostgreSQL (equivalente a PyMySQL en MariaDB)
+psycopg2-binary==2.9.9   # Driver de PostgreSQL
 pandas==2.2.3             # run_query() regresa DataFrames (usado por todos los módulos)
 
 # --- Configuración y seguridad ---
 python-dotenv==1.0.1      # Carga .env en desarrollo local sin Docker
 bcrypt==4.2.0             # Hash de contraseñas de usuarios
+
+# --- Pruebas ---
+pytest==8.3.3

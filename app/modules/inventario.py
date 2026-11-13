@@ -1,4 +1,5 @@
 """Módulo de Inventario: stock crítico, insumos, existencias, ajustes y mermas."""
+import json
 from decimal import Decimal
 
 import streamlit as st
@@ -8,7 +9,13 @@ from sqlalchemy import text
 from auth import usuario_actual
 from database import run_query, execute, transaccion
 from permissions import requerir_rol, requerir_accion, ADMIN, GERENTE
-from services.mermas import PATRON_DETALLE, PREFIJO_MOTIVO, TABLA_MERMA_DETALLE
+from services.mermas import (
+    PATRON_DETALLE,
+    PREFIJO_MOTIVO,
+    TABLA_MERMA_DETALLE,
+    TABLA_MERMA_PENDIENTE,
+    TABLA_REPOSICION,
+)
 from services.ventas import VentaError, recalcular_total_orden
 
 
@@ -17,27 +24,117 @@ def _es_nulo(valor) -> bool:
     return valor is None or valor != valor
 
 
-def _subir_merma_en(conn, id_merma: int) -> None:
-    """Sube una merma: descuenta inventario y fija su costo.
+def _registrar_ajuste(
+    *,
+    id_insumo: int,
+    tipo: str,
+    cantidad,
+    motivo: str,
+    id_empleado: int,
+) -> None:
+    """Aplica un ajuste de inventario atómico, validando stock al restar."""
+    nombre_tipo = (
+        "Ajuste positivo" if str(tipo).startswith("Ajuste positivo")
+        else "Ajuste negativo"
+    )
+    cantidad_dec = Decimal(str(cantidad))
+    if cantidad_dec <= 0:
+        raise VentaError("La cantidad del ajuste debe ser mayor que cero.")
+    with transaccion() as conn:
+        fila = conn.execute(
+            text(
+                """
+                SELECT i.stock_actual, u.abreviatura AS unidad
+                FROM insumos i
+                JOIN unidades_medida u ON u.id_unidad = i.id_unidad_medida
+                WHERE i.id_insumo = :insumo
+                FOR UPDATE OF i
+                """
+            ),
+            {"insumo": int(id_insumo)},
+        ).mappings().first()
+        if fila is None:
+            raise VentaError("El insumo seleccionado ya no existe.")
 
-    Todas las mermas (de producto/partida o capturadas directamente sobre un
-    insumo) quedaron pendientes sin tocar stock al reportarse. Al subirlas, el
-    Gerente confirma la pérdida y aquí se descuenta formalmente el inventario.
+        disponible = Decimal(str(fila["stock_actual"]))
+        if nombre_tipo == "Ajuste negativo" and disponible < cantidad_dec:
+            raise VentaError(
+                "No se puede aplicar el ajuste negativo: stock "
+                f"disponible {disponible:.3f} {fila['unidad']}."
+            )
+
+        id_tipo = conn.execute(
+            text(
+                "SELECT id_tipo_movimiento FROM "
+                "tipos_movimiento_inventario WHERE nombre = :n"
+            ),
+            {"n": nombre_tipo},
+        ).scalar_one()
+
+        conn.execute(
+            text(
+                """
+                INSERT INTO movimientos_inventario
+                    (id_insumo, id_tipo_movimiento, cantidad,
+                     motivo, id_empleado)
+                VALUES (:i, :t, :c, :m, :e)
+                """
+            ),
+            {
+                "i": int(id_insumo),
+                "t": int(id_tipo),
+                "c": cantidad_dec,
+                "m": motivo or "Ajuste manual",
+                "e": int(id_empleado),
+            },
+        )
+        signo = 1 if nombre_tipo == "Ajuste positivo" else -1
+        conn.execute(
+            text(
+                "UPDATE insumos SET stock_actual = stock_actual + :c "
+                "WHERE id_insumo = :i"
+            ),
+            {"c": signo * cantidad_dec, "i": int(id_insumo)},
+        )
+
+
+def _datos_json(valor) -> dict:
+    """Normaliza el JSONB de auditoría a dict."""
+    if isinstance(valor, dict):
+        return valor
+    if not valor:
+        return {}
+    try:
+        return json.loads(valor)
+    except (TypeError, ValueError):
+        return {}
+
+
+def _subir_merma_en(conn, id_merma: int) -> None:
+    """Confirma una merma pendiente.
+
+    - Partida ya vendida: solo registra el costo; la venta ya descontó stock.
+    - Captura manual de producto/insumo: descuenta stock en este momento.
     """
     fila = conn.execute(
         text(
             """
-            SELECT m.id_merma, m.costo_estimado_perdida,
-                   mi.id_movimiento, mi.id_insumo, mi.cantidad,
-                   mi.motivo, i.stock_actual, i.costo_unitario_referencia
+            SELECT m.id_merma, m.costo_estimado_perdida, m.id_movimiento,
+                   a.datos_nuevos AS pendiente
             FROM mermas m
-            JOIN movimientos_inventario mi ON mi.id_movimiento = m.id_movimiento
-            JOIN insumos i ON i.id_insumo = mi.id_insumo
+            LEFT JOIN LATERAL (
+                SELECT datos_nuevos
+                FROM auditoria
+                WHERE tabla_afectada = :tabla
+                  AND id_registro_afectado = m.id_merma
+                ORDER BY id_auditoria DESC
+                LIMIT 1
+            ) a ON TRUE
             WHERE m.id_merma = :id
-            FOR UPDATE
+            FOR UPDATE OF m
             """
         ),
-        {"id": id_merma},
+        {"id": id_merma, "tabla": TABLA_MERMA_PENDIENTE},
     ).mappings().first()
 
     if fila is None:
@@ -46,34 +143,147 @@ def _subir_merma_en(conn, id_merma: int) -> None:
         # Idempotencia: si ya se subió, no volver a descontar stock.
         return
 
-    if Decimal(str(fila["stock_actual"])) < Decimal(str(fila["cantidad"])):
-        raise VentaError("No hay stock suficiente para descontar la merma reportada.")
-
-    id_tipo_merma = conn.execute(
-        text(
-            "SELECT id_tipo_movimiento FROM tipos_movimiento_inventario "
-            "WHERE nombre = 'Merma'"
+    datos = _datos_json(fila["pendiente"])
+    if not datos:
+        # Compatibilidad con reportes antiguos que sí creaban el movimiento.
+        movimiento = conn.execute(
+            text(
+                """
+                SELECT mi.id_movimiento, mi.id_insumo, mi.cantidad,
+                       i.stock_actual, i.costo_unitario_referencia
+                FROM mermas m
+                JOIN movimientos_inventario mi
+                  ON mi.id_movimiento = m.id_movimiento
+                JOIN insumos i ON i.id_insumo = mi.id_insumo
+                WHERE m.id_merma = :id
+                FOR UPDATE OF i
+                """
+            ),
+            {"id": id_merma},
+        ).mappings().first()
+        if movimiento is None:
+            raise VentaError("El reporte de merma no tiene datos pendientes.")
+        if Decimal(str(movimiento["stock_actual"])) < Decimal(
+            str(movimiento["cantidad"])
+        ):
+            raise VentaError(
+                "No hay stock suficiente para descontar la merma reportada."
+            )
+        id_tipo_merma = conn.execute(
+            text(
+                "SELECT id_tipo_movimiento FROM tipos_movimiento_inventario "
+                "WHERE nombre = 'Merma'"
+            )
+        ).scalar_one()
+        conn.execute(
+            text(
+                "UPDATE movimientos_inventario SET id_tipo_movimiento = :tipo "
+                "WHERE id_movimiento = :movimiento"
+            ),
+            {
+                "tipo": int(id_tipo_merma),
+                "movimiento": int(movimiento["id_movimiento"]),
+            },
         )
-    ).scalar_one()
+        conn.execute(
+            text(
+                "UPDATE insumos SET stock_actual = stock_actual - :c "
+                "WHERE id_insumo = :i"
+            ),
+            {
+                "c": movimiento["cantidad"],
+                "i": int(movimiento["id_insumo"]),
+            },
+        )
+        costo = Decimal(str(movimiento["cantidad"])) * Decimal(
+            str(movimiento["costo_unitario_referencia"] or 0)
+        )
+        conn.execute(
+            text(
+                "UPDATE mermas SET costo_estimado_perdida = :costo "
+                "WHERE id_merma = :id"
+            ),
+            {"costo": costo, "id": id_merma},
+        )
+        return
 
+    origen = str(
+        datos.get("origen")
+        or ("partida" if datos.get("id_detalle") else "insumo")
+    )
+    id_insumo = int(datos["id_insumo"])
+    cantidad = Decimal(str(datos["cantidad"]))
+    id_empleado = int(datos["id_empleado"])
+    producto = str(datos.get("producto") or "Producto")
+    motivo = str(datos.get("motivo") or "Sin motivo capturado")
+    id_orden = datos.get("id_orden")
+
+    insumo = conn.execute(
+        text(
+            """
+            SELECT stock_actual, costo_unitario_referencia
+            FROM insumos
+            WHERE id_insumo = :insumo
+            FOR UPDATE
+            """
+        ),
+        {"insumo": id_insumo},
+    ).mappings().first()
+    if insumo is None:
+        raise VentaError("El insumo de la merma ya no existe.")
+
+    id_movimiento = None
+    if origen != "partida":
+        if Decimal(str(insumo["stock_actual"])) < cantidad:
+            raise VentaError(
+                "No hay stock suficiente para descontar la merma reportada."
+            )
+        id_tipo_merma = conn.execute(
+            text(
+                "SELECT id_tipo_movimiento FROM tipos_movimiento_inventario "
+                "WHERE nombre = 'Merma'"
+            )
+        ).scalar_one()
+        id_movimiento = conn.execute(
+            text(
+                """
+                INSERT INTO movimientos_inventario
+                    (id_insumo, id_tipo_movimiento, cantidad, motivo,
+                     id_empleado, id_orden)
+                VALUES (:insumo, :tipo, :cantidad, :motivo, :empleado, :orden)
+                RETURNING id_movimiento
+                """
+            ),
+            {
+                "insumo": id_insumo,
+                "tipo": int(id_tipo_merma),
+                "cantidad": cantidad,
+                "motivo": f"Merma confirmada | {producto} | {motivo}"[:150],
+                "empleado": id_empleado,
+                "orden": id_orden,
+            },
+        ).scalar_one()
+        conn.execute(
+            text(
+                "UPDATE insumos SET stock_actual = stock_actual - :c "
+                "WHERE id_insumo = :i"
+            ),
+            {"c": cantidad, "i": id_insumo},
+        )
+
+    costo = cantidad * Decimal(
+        str(insumo["costo_unitario_referencia"] or 0)
+    )
     conn.execute(
         text(
-            "UPDATE movimientos_inventario SET id_tipo_movimiento = :tipo "
-            "WHERE id_movimiento = :movimiento"
+            "UPDATE mermas SET id_movimiento = :movimiento, "
+            "costo_estimado_perdida = :costo WHERE id_merma = :id"
         ),
-        {"tipo": int(id_tipo_merma), "movimiento": int(fila["id_movimiento"])},
-    )
-    conn.execute(
-        text("UPDATE insumos SET stock_actual = stock_actual - :c WHERE id_insumo = :i"),
-        {"c": fila["cantidad"], "i": int(fila["id_insumo"])},
-    )
-
-    costo = Decimal(str(fila["cantidad"])) * Decimal(
-        str(fila["costo_unitario_referencia"] or 0)
-    )
-    conn.execute(
-        text("UPDATE mermas SET costo_estimado_perdida = :costo WHERE id_merma = :id"),
-        {"costo": costo, "id": id_merma},
+        {
+            "movimiento": int(id_movimiento) if id_movimiento is not None else None,
+            "costo": costo,
+            "id": id_merma,
+        },
     )
 
 
@@ -85,7 +295,7 @@ def _subir_mermas(ids_mermas: list[int]) -> None:
 
 
 def _rechazar_mermas(ids_mermas: list[int]) -> None:
-    """Rechaza/elimina un reporte completo y restaura el total si era de producto."""
+    """Rechaza/elimina un reporte pendiente y restaura el total si era partida."""
     detalles: dict[int, int | None] = {}
     ordenes: set[int] = set()
 
@@ -94,34 +304,113 @@ def _rechazar_mermas(ids_mermas: list[int]) -> None:
             fila = conn.execute(
                 text(
                     """
-                    SELECT mi.id_movimiento, mi.motivo, mi.id_orden
+                    SELECT m.id_merma, m.costo_estimado_perdida,
+                           m.id_movimiento,
+                           a.datos_nuevos AS pendiente
                     FROM mermas m
-                    JOIN movimientos_inventario mi ON mi.id_movimiento = m.id_movimiento
+                    LEFT JOIN LATERAL (
+                        SELECT datos_nuevos
+                        FROM auditoria
+                        WHERE tabla_afectada = :tabla
+                          AND id_registro_afectado = m.id_merma
+                        ORDER BY id_auditoria DESC
+                        LIMIT 1
+                    ) a ON TRUE
                     WHERE m.id_merma = :id
-                    FOR UPDATE
+                    FOR UPDATE OF m
                     """
                 ),
-                {"id": int(id_merma)},
+                {"id": int(id_merma), "tabla": TABLA_MERMA_PENDIENTE},
             ).mappings().first()
             if fila is None:
                 continue
+            if not _es_nulo(fila["costo_estimado_perdida"]):
+                raise VentaError(
+                    "Esta merma ya fue subida; no se puede rechazar."
+                )
 
-            if str(fila["motivo"] or "").startswith(PREFIJO_MOTIVO):
-                coincidencia = PATRON_DETALLE.search(str(fila["motivo"]))
+            datos = _datos_json(fila["pendiente"])
+            if datos:
+                id_detalle = datos.get("id_detalle")
+                if id_detalle is not None:
+                    id_detalle = int(id_detalle)
+                    reposicion = conn.execute(
+                        text(
+                            """
+                            SELECT 1
+                            FROM auditoria
+                            WHERE tabla_afectada = :tabla
+                              AND id_registro_afectado = :detalle
+                            LIMIT 1
+                            """
+                        ),
+                        {
+                            "tabla": TABLA_REPOSICION,
+                            "detalle": id_detalle,
+                        },
+                    ).scalar()
+                    if reposicion:
+                        raise VentaError(
+                            "Esta merma ya tiene reposición; no se puede "
+                            "rechazar."
+                        )
+                    id_orden = datos.get("id_orden")
+                    detalles[id_detalle] = (
+                        int(id_orden) if id_orden is not None else None
+                    )
+                conn.execute(
+                    text(
+                        "DELETE FROM auditoria WHERE tabla_afectada = :tabla "
+                        "AND id_registro_afectado = :merma"
+                    ),
+                    {
+                        "tabla": TABLA_MERMA_PENDIENTE,
+                        "merma": int(id_merma),
+                    },
+                )
+                conn.execute(
+                    text("DELETE FROM mermas WHERE id_merma = :id"),
+                    {"id": int(id_merma)},
+                )
+                continue
+
+            # Compatibilidad con reportes antiguos que tenían movimiento.
+            movimiento = None
+            if fila["id_movimiento"] is not None:
+                movimiento = conn.execute(
+                    text(
+                        """
+                        SELECT id_movimiento, motivo, id_orden
+                        FROM movimientos_inventario
+                        WHERE id_movimiento = :movimiento
+                        FOR UPDATE
+                        """
+                    ),
+                    {"movimiento": int(fila["id_movimiento"])},
+                ).mappings().first()
+            if movimiento is not None and str(
+                movimiento["motivo"] or ""
+            ).startswith(PREFIJO_MOTIVO):
+                coincidencia = PATRON_DETALLE.search(str(movimiento["motivo"]))
                 if coincidencia:
                     detalles[int(coincidencia.group(1))] = (
-                        int(fila["id_orden"]) if fila["id_orden"] is not None else None
+                        int(movimiento["id_orden"])
+                        if movimiento["id_orden"] is not None
+                        else None
                     )
 
             conn.execute(
-                text("DELETE FROM mermas WHERE id_merma = :id"), {"id": int(id_merma)}
+                text("DELETE FROM mermas WHERE id_merma = :id"),
+                {"id": int(id_merma)},
             )
-            conn.execute(
-                text(
-                    "DELETE FROM movimientos_inventario WHERE id_movimiento = :movimiento"
-                ),
-                {"movimiento": int(fila["id_movimiento"])},
-            )
+            if movimiento is not None:
+                conn.execute(
+                    text(
+                        "DELETE FROM movimientos_inventario "
+                        "WHERE id_movimiento = :movimiento"
+                    ),
+                    {"movimiento": int(movimiento["id_movimiento"])},
+                )
 
         # Al rechazar, la partida vuelve a ser cobrable y deja de estar tachada.
         for id_detalle, id_orden in detalles.items():
@@ -129,7 +418,8 @@ def _rechazar_mermas(ids_mermas: list[int]) -> None:
                 text(
                     """
                     DELETE FROM auditoria
-                    WHERE tabla_afectada = :tabla AND id_registro_afectado = :detalle
+                    WHERE tabla_afectada = :tabla
+                      AND id_registro_afectado = :detalle
                     """
                 ),
                 {"tabla": TABLA_MERMA_DETALLE, "detalle": id_detalle},
@@ -185,8 +475,18 @@ def _render_reporte_producto(filas: list) -> None:
 
     with st.container(border=True):
         c1, c2, c3 = st.columns([3, 2, 2])
+        tipo_origen = str(primera["tipo_origen"])
         c1.markdown(f"**Producto:** {producto}")
-        c1.caption("Tipo: Producto preparado · descuenta los insumos de su receta")
+        if tipo_origen == "partida":
+            c1.caption(
+                "Tipo: Producto preparado · partida ya vendida: al subir solo "
+                "se registra el costo (no descuenta stock adicional)"
+            )
+        else:
+            c1.caption(
+                "Tipo: Producto preparado · captura manual: al subir descuenta "
+                "los insumos de su receta"
+            )
         c1.caption(f"Motivo: {motivo or 'Sin motivo capturado'}")
         c2.markdown(f"**Fecha:** {primera['fecha']}")
         c2.caption(f"**Empleado que reporta:** {primera['empleado_reporta']}")
@@ -224,7 +524,13 @@ def _render_reporte_producto(filas: list) -> None:
                 else:
                     st.rerun()
         else:
-            st.caption("✔ Merma subida: stock descontado y costo registrado.")
+            if tipo_origen == "partida":
+                st.caption(
+                    "✔ Merma subida: costo registrado; el stock ya se había "
+                    "descontado al vender la partida."
+                )
+            else:
+                st.caption("✔ Merma subida: stock descontado y costo registrado.")
 
 
 def _render_reporte_individual(reporte) -> None:
@@ -553,33 +859,60 @@ def _render_gestion_mermas() -> None:
     # y se descuenta formalmente el stock del insumo.
     reportes = run_query(
         """
-        SELECT m.id_merma, i.nombre AS insumo, mi.fecha_movimiento AS fecha,
-               CONCAT(e.nombre, ' ', e.apellido) AS empleado_reporta,
+        SELECT m.id_merma, i.nombre AS insumo,
+               COALESCE(mi.fecha_movimiento, m.fecha_deteccion) AS fecha,
+               COALESCE(CONCAT(e.nombre, ' ', e.apellido), '—') AS empleado_reporta,
                u.nombre_usuario AS usuario_registro,
                m.descripcion AS motivo, mi.motivo AS movimiento_motivo,
-               mi.cantidad, um.abreviatura AS unidad,
+               COALESCE(
+                   mi.cantidad,
+                   (a.datos_nuevos ->> 'cantidad')::numeric
+               ) AS cantidad,
+               um.abreviatura AS unidad,
+               a.datos_nuevos ->> 'reporte' AS reporte,
+               COALESCE(a.datos_nuevos ->> 'origen', 'insumo') AS tipo_origen,
                m.costo_estimado_perdida
         FROM mermas m
-        JOIN movimientos_inventario mi ON mi.id_movimiento = m.id_movimiento
-        JOIN insumos i ON i.id_insumo = mi.id_insumo
+        LEFT JOIN LATERAL (
+            SELECT datos_nuevos
+            FROM auditoria
+            WHERE tabla_afectada = :tabla
+              AND id_registro_afectado = m.id_merma
+            ORDER BY id_auditoria DESC
+            LIMIT 1
+        ) a ON TRUE
+        LEFT JOIN movimientos_inventario mi
+          ON mi.id_movimiento = m.id_movimiento
+        JOIN insumos i ON i.id_insumo = COALESCE(
+            mi.id_insumo,
+            (a.datos_nuevos ->> 'id_insumo')::int
+        )
         JOIN unidades_medida um ON um.id_unidad = i.id_unidad_medida
-        JOIN empleados e ON e.id_empleado = mi.id_empleado
+        LEFT JOIN empleados e ON e.id_empleado = COALESCE(
+            mi.id_empleado,
+            m.id_empleado_responsable,
+            (a.datos_nuevos ->> 'id_empleado')::int
+        )
         JOIN usuarios u ON u.id_usuario = m.id_usuario_registro
-        ORDER BY mi.fecha_movimiento DESC, m.id_merma DESC
-        """
+        ORDER BY fecha DESC, m.id_merma DESC
+        """,
+        {"tabla": TABLA_MERMA_PENDIENTE},
     )
 
     if reportes.empty:
         st.info("No hay reportes de mermas registrados.")
         return
 
-    # Los reportes hechos desde Comandas/Órdenes generan una fila por insumo.
-    # Se agrupan por movimiento para mostrarlos como un solo reporte.
+    # Cada reporte genera una fila por insumo. El token de auditoría permite
+    # agruparlos; los datos antiguos se agrupan por movimiento o individualmente.
     grupos: dict[tuple[str, object], list] = {}
     for _, reporte in reportes.iterrows():
+        token = reporte["reporte"]
         movimiento = str(reporte["movimiento_motivo"] or "")
-        if movimiento.startswith(PREFIJO_MOTIVO):
-            clave: tuple[str, object] = ("producto", movimiento)
+        if not _es_nulo(token) and str(token).strip():
+            clave: tuple[str, object] = ("reporte", str(token))
+        elif movimiento.startswith(PREFIJO_MOTIVO):
+            clave = ("producto", movimiento)
         else:
             clave = ("individual", int(reporte["id_merma"]))
         grupos.setdefault(clave, []).append(reporte)
@@ -594,11 +927,16 @@ def _render_gestion_mermas() -> None:
             f"Hay {pendientes} reporte(s) de merma pendiente(s) de autorización."
         )
 
-    for (tipo, _), filas in grupos.items():
-        if tipo == "producto":
+    for filas in grupos.values():
+        primera = filas[0]
+        es_producto = str(primera["tipo_origen"]) in (
+            "partida",
+            "producto",
+        ) or str(primera["movimiento_motivo"] or "").startswith(PREFIJO_MOTIVO)
+        if es_producto:
             _render_reporte_producto(filas)
         else:
-            _render_reporte_individual(filas[0])
+            _render_reporte_individual(primera)
 
 
 def render():
@@ -666,10 +1004,6 @@ def render():
 
         if enviado:
             requerir_accion("inventario.gestionar")
-            nombre_tipo = "Ajuste positivo" if tipo.startswith("Ajuste positivo") else "Ajuste negativo"
-            id_tipo = run_query(
-                "SELECT id_tipo_movimiento FROM tipos_movimiento_inventario WHERE nombre = :n", {"n": nombre_tipo}
-            ).iloc[0]["id_tipo_movimiento"]
 
             auth = usuario_actual()
             if auth["id_empleado"] is None:
@@ -679,19 +1013,19 @@ def render():
                     "administrador que la vincule en el módulo Usuarios."
                 )
                 st.stop()
-            execute(
-                """
-                INSERT INTO movimientos_inventario (id_insumo, id_tipo_movimiento, cantidad, motivo, id_empleado)
-                VALUES (:i, :t, :c, :m, :e)
-                """,
-                {"i": int(insumo["id_insumo"]), "t": int(id_tipo), "c": cantidad,
-                 "m": motivo or "Ajuste manual", "e": auth["id_empleado"]},
-            )
-            signo = 1 if nombre_tipo == "Ajuste positivo" else -1
-            execute(
-                "UPDATE insumos SET stock_actual = stock_actual + :c WHERE id_insumo = :i",
-                {"c": signo * cantidad, "i": int(insumo["id_insumo"])},
-            )
+
+            try:
+                _registrar_ajuste(
+                    id_insumo=int(insumo["id_insumo"]),
+                    tipo=tipo,
+                    cantidad=cantidad,
+                    motivo=motivo,
+                    id_empleado=int(auth["id_empleado"]),
+                )
+            except (VentaError, SQLAlchemyError) as exc:
+                st.error(f"No se pudo registrar el ajuste: {exc}")
+                return
+
             st.success("Movimiento registrado y stock actualizado.")
             st.rerun()
 

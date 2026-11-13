@@ -5,16 +5,20 @@ Una partida de ``detalles_orden`` se marca como mermada en la bitácora
 que consultan Comandas y Órdenes para tachar el producto y la que usa el
 recalculo de totales para no cobrarlo.
 
-Para que el Gerente vea el reporte en Inventario > Gestión de Mermas se crea,
-en la misma transacción, un movimiento de inventario tipo ``Merma`` por cada
-insumo de la receta y su fila correspondiente en ``mermas``. El stock NO se
-descuenta al reportar: queda pendiente hasta que el Gerente pulsa
-``Subir merma``, que confirma el costo y descuenta formalmente el inventario.
+Al reportar se crean filas en ``mermas`` con ``id_movimiento = NULL`` y una
+marca en ``auditoria`` (``tabla_afectada = 'mermas_pendientes'``) con el
+insumo, cantidad y contexto del reporte. No se crean movimientos ni se toca
+el stock: la venta ya descontó la receta cuando se cobró la orden.
+
+Al pulsar ``Subir merma`` el Gerente confirma la pérdida. Para partidas ya
+vendidas solo se registra el costo (no se vuelve a descontar stock); para
+capturas manuales de producto/insumo se inserta el movimiento tipo ``Merma``
+y se descuenta el inventario en ese momento.
 
 También existen capturas generales sin una orden de por medio:
 
-- ``registrar_merma_producto``: parte de un producto del menú y genera un
-  movimiento por cada insumo de su receta.
+- ``registrar_merma_producto``: parte de un producto del menú y genera una
+  merma pendiente por cada insumo de su receta.
 - ``registrar_merma_insumo``: afecta directamente un insumo base (kg, l, pza).
 
 Ambas quedan pendientes hasta que el Gerente las suba o elimine desde
@@ -31,9 +35,16 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
 from database import transaccion
-from services.ventas import VentaError, recalcular_total_orden
+from services.ventas import (
+    StockInsuficienteError,
+    VentaError,
+    descontar_inventario,
+    recalcular_total_orden,
+)
 
 TABLA_MERMA_DETALLE = "detalles_orden_merma"
+TABLA_MERMA_PENDIENTE = "mermas_pendientes"
+TABLA_REPOSICION = "detalles_orden_reposicion"
 PREFIJO_MOTIVO = "Merma producto"
 PREFIJO_INSUMO = "Merma insumo"
 PATRON_DETALLE = re.compile(r"detalle#(\d+)", re.IGNORECASE)
@@ -86,10 +97,12 @@ def _crear_mermas_de_receta(
     id_usuario: int,
     id_empleado: int,
     nombre_tipo_merma: str,
+    origen_tipo: str,
     id_orden: int | None = None,
     id_detalle: int | None = None,
+    reporte: str | None = None,
 ) -> list[int]:
-    """Crea un movimiento + merma pendiente por cada insumo de la receta."""
+    """Crea una merma pendiente por cada insumo de la receta, sin tocar stock."""
     receta = conn.execute(
         text(
             """
@@ -109,14 +122,8 @@ def _crear_mermas_de_receta(
             "no se puede descontar inventario. Agrega su receta primero."
         )
 
-    id_tipo_movimiento = _id_tipo_movimiento_merma(conn)
     id_tipo_merma = _id_tipo_merma(conn, nombre_tipo_merma)
-    if id_detalle is not None:
-        referencia = f" detalle#{int(id_detalle)}"
-    else:
-        # Token único para que dos capturas generales del mismo producto y
-        # motivo no se agrupen como si fueran un solo reporte.
-        referencia = f" general-{time.time_ns()}"
+    reporte = reporte or f"{origen_tipo}-{time.time_ns()}"
     descripcion = _truncar(f"Producto: {producto} | Motivo: {motivo}", 255)
     ids_mermas: list[int] = []
 
@@ -127,48 +134,59 @@ def _crear_mermas_de_receta(
         if cantidad <= 0:
             continue
 
-        motivo_movimiento = _truncar(
-            f"{PREFIJO_MOTIVO}{referencia} | {producto} | {motivo}",
-            150,
-        )
-        movimiento = conn.execute(
-            text(
-                """
-                INSERT INTO movimientos_inventario
-                    (id_insumo, id_tipo_movimiento, cantidad, motivo,
-                     id_empleado, id_orden)
-                VALUES (:insumo, :tipo, :cantidad, :motivo, :empleado, :orden)
-                RETURNING id_movimiento
-                """
-            ),
-            {
-                "insumo": int(item["id_insumo"]),
-                "tipo": id_tipo_movimiento,
-                "cantidad": cantidad,
-                "motivo": motivo_movimiento,
-                "empleado": id_empleado,
-                "orden": id_orden,
-            },
-        )
         id_merma = conn.execute(
             text(
                 """
                 INSERT INTO mermas
                     (id_movimiento, id_tipo_merma, id_empleado_responsable,
                      id_usuario_registro, descripcion)
-                VALUES (:movimiento, :tipo, :empleado, :usuario, :descripcion)
+                VALUES (NULL, :tipo, :empleado, :usuario, :descripcion)
                 RETURNING id_merma
                 """
             ),
             {
-                "movimiento": int(movimiento.scalar_one()),
                 "tipo": id_tipo_merma,
                 "empleado": id_empleado,
                 "usuario": id_usuario,
                 "descripcion": descripcion,
             },
         ).scalar_one()
-        ids_mermas.append(int(id_merma))
+        id_merma = int(id_merma)
+        ids_mermas.append(id_merma)
+
+        conn.execute(
+            text(
+                """
+                INSERT INTO auditoria
+                    (id_usuario, tabla_afectada, id_registro_afectado,
+                     accion, datos_nuevos)
+                VALUES (:usuario, :tabla, :merma, 'INSERT',
+                        CAST(:datos AS jsonb))
+                """
+            ),
+            {
+                "usuario": id_usuario,
+                "tabla": TABLA_MERMA_PENDIENTE,
+                "merma": id_merma,
+                "datos": json.dumps(
+                    {
+                        "id_merma": id_merma,
+                        "id_insumo": int(item["id_insumo"]),
+                        "insumo": item["insumo"],
+                        "cantidad": str(cantidad),
+                        "id_orden": id_orden,
+                        "id_detalle": id_detalle,
+                        "origen": origen_tipo,
+                        "reporte": reporte,
+                        "motivo": motivo,
+                        "producto": producto,
+                        "id_empleado": id_empleado,
+                        "tipo_merma": nombre_tipo_merma,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        )
 
     if not ids_mermas:
         raise MermaError("La receta no genera cantidades válidas para mermar.")
@@ -244,6 +262,7 @@ def registrar_merma_detalle(
     motivo: str,
     origen: str = "orden",
     liberar_mesa_si_total: bool = True,
+    repetir: bool = False,
 ) -> list[int]:
     """Reporta la merma de una partida y devuelve los ids de ``mermas``.
 
@@ -252,7 +271,8 @@ def registrar_merma_detalle(
     si falla cualquier paso no queda ni la marca ni el movimiento.
 
     ``liberar_mesa_si_total`` desactiva la cancelación automática cuando el
-    flujo va a reponer la partida (por ejemplo, "Mermar y repetir").
+    flujo va a reponer la partida. ``repetir`` crea la reposición y descuenta
+    su receta dentro de la misma transacción.
     """
     motivo = (motivo or "").strip()
     if not motivo:
@@ -314,8 +334,10 @@ def registrar_merma_detalle(
             id_usuario=id_usuario,
             id_empleado=id_empleado,
             nombre_tipo_merma=nombre_tipo_merma,
+            origen_tipo="partida",
             id_orden=int(fila["id_orden"]),
             id_detalle=id_detalle,
+            reporte=f"partida-{int(id_detalle)}-{time.time_ns()}",
         )
 
         conn.execute(
@@ -349,8 +371,12 @@ def registrar_merma_detalle(
         # libera la mesa. En órdenes pagadas el pago histórico no se altera.
         if estado_orden not in ("Pagada", "Cancelada"):
             recalcular_total_orden(conn, int(fila["id_orden"]))
-            if liberar_mesa_si_total and _todas_las_partidas_activas_mermadas(
-                conn, int(fila["id_orden"])
+            if (
+                not repetir
+                and liberar_mesa_si_total
+                and _todas_las_partidas_activas_mermadas(
+                    conn, int(fila["id_orden"])
+                )
             ):
                 _cancelar_orden_y_liberar_mesa(
                     conn,
@@ -362,118 +388,195 @@ def registrar_merma_detalle(
                     ),
                 )
 
+        if repetir:
+            _repetir_detalle_en(conn, id_detalle, id_empleado=id_empleado)
+
     return ids_mermas
 
 
-def repetir_detalle_mermado(*, id_detalle: int) -> int:
-    """Clona una partida mermada en la misma orden, en estado ``Pendiente``.
+def _repetir_detalle_en(
+    conn: Connection, id_detalle: int, *, id_empleado: int | None
+) -> int:
+    """Crea la reposición y descuenta su receta dentro de la transacción actual."""
+    fila = conn.execute(
+        text(
+            """
+            SELECT d.id_orden, d.id_producto, d.cantidad,
+                   d.precio_unitario, d.id_area_preparacion,
+                   eo.nombre AS estado_orden
+            FROM detalles_orden d
+            JOIN ordenes o ON o.id_orden = d.id_orden
+            JOIN estados_orden eo ON eo.id_estado = o.id_estado
+            WHERE d.id_detalle = :detalle
+            FOR UPDATE OF d, o
+            """
+        ),
+        {"detalle": int(id_detalle)},
+    ).mappings().first()
+    if fila is None:
+        raise MermaError("La partida ya no existe.")
 
-    Se usa cuando el producto se perdió pero debe prepararse de nuevo. La copia
-    conserva producto, cantidad, precio y área de preparación, y vuelve a entrar
-    al KDS. En cuentas abiertas el total se recalcula para incluir la reposición;
-    en órdenes ya pagadas no se altera el pago histórico.
-    """
-    with transaccion() as conn:
-        fila = conn.execute(
+    mermada = conn.execute(
+        text(
+            """
+            SELECT 1
+            FROM auditoria
+            WHERE tabla_afectada = :tabla AND id_registro_afectado = :detalle
+            LIMIT 1
+            """
+        ),
+        {"tabla": TABLA_MERMA_DETALLE, "detalle": int(id_detalle)},
+    ).scalar()
+    if not mermada:
+        raise MermaError("La partida no está reportada como merma.")
+
+    ya_repetida = conn.execute(
+        text(
+            """
+            SELECT 1
+            FROM auditoria
+            WHERE tabla_afectada = :tabla
+              AND id_registro_afectado = :detalle
+            LIMIT 1
+            """
+        ),
+        {"tabla": TABLA_REPOSICION, "detalle": int(id_detalle)},
+    ).scalar()
+    if ya_repetida:
+        raise MermaError("Esta merma ya tiene una reposición registrada.")
+
+    id_pendiente = conn.execute(
+        text(
+            "SELECT id_estado FROM estados_detalle_orden "
+            "WHERE nombre = 'Pendiente'"
+        )
+    ).scalar_one_or_none()
+    if id_pendiente is None:
+        raise MermaError("Falta el estado 'Pendiente' en el catálogo.")
+
+    comentario = conn.execute(
+        text(
+            """
+            SELECT id_usuario, datos_nuevos ->> 'comentario' AS comentario
+            FROM auditoria
+            WHERE tabla_afectada = 'detalles_orden_comentario'
+              AND id_registro_afectado = :detalle
+            ORDER BY id_auditoria DESC
+            LIMIT 1
+            """
+        ),
+        {"detalle": int(id_detalle)},
+    ).mappings().first()
+
+    id_nuevo = conn.execute(
+        text(
+            """
+            INSERT INTO detalles_orden
+                (id_orden, id_producto, cantidad, precio_unitario,
+                 id_area_preparacion, id_estado)
+            VALUES (:orden, :producto, :cantidad, :precio, :area, :estado)
+            RETURNING id_detalle
+            """
+        ),
+        {
+            "orden": int(fila["id_orden"]),
+            "producto": int(fila["id_producto"]),
+            "cantidad": int(fila["cantidad"]),
+            "precio": fila["precio_unitario"],
+            "area": int(fila["id_area_preparacion"]),
+            "estado": int(id_pendiente),
+        },
+    ).scalar_one()
+    id_nuevo = int(id_nuevo)
+
+    if comentario and (comentario["comentario"] or "").strip():
+        conn.execute(
             text(
                 """
-                SELECT d.id_orden, d.id_producto, d.cantidad,
-                       d.precio_unitario, d.id_area_preparacion,
-                       eo.nombre AS estado_orden
-                FROM detalles_orden d
-                JOIN ordenes o ON o.id_orden = d.id_orden
-                JOIN estados_orden eo ON eo.id_estado = o.id_estado
-                WHERE d.id_detalle = :detalle
-                FOR UPDATE OF d, o
+                INSERT INTO auditoria
+                    (id_usuario, tabla_afectada, id_registro_afectado,
+                     accion, datos_nuevos)
+                VALUES (:usuario, 'detalles_orden_comentario', :detalle,
+                        'INSERT', CAST(:datos AS jsonb))
                 """
             ),
-            {"detalle": int(id_detalle)},
-        ).mappings().first()
-        if fila is None:
-            raise MermaError("La partida ya no existe.")
+            {
+                "usuario": comentario["id_usuario"],
+                "detalle": id_nuevo,
+                "datos": json.dumps(
+                    {"comentario": comentario["comentario"]},
+                    ensure_ascii=False,
+                ),
+            },
+        )
 
-        mermada = conn.execute(
-            text(
-                """
-                SELECT 1
-                FROM auditoria
-                WHERE tabla_afectada = :tabla AND id_registro_afectado = :detalle
-                LIMIT 1
-                """
+    conn.execute(
+        text(
+            """
+            INSERT INTO auditoria
+                (id_usuario, tabla_afectada, id_registro_afectado,
+                 accion, datos_nuevos)
+            VALUES
+                (NULL, :tabla, :detalle, 'INSERT', CAST(:datos AS jsonb))
+            """
+        ),
+        {
+            "tabla": TABLA_REPOSICION,
+            "detalle": int(id_detalle),
+            "datos": json.dumps(
+                {"id_detalle_reposicion": id_nuevo}, ensure_ascii=False
             ),
-            {"tabla": TABLA_MERMA_DETALLE, "detalle": int(id_detalle)},
-        ).scalar()
-        if not mermada:
-            raise MermaError("La partida no está reportada como merma.")
+        },
+    )
 
-        id_pendiente = conn.execute(
-            text(
-                "SELECT id_estado FROM estados_detalle_orden "
-                "WHERE nombre = 'Pendiente'"
+    if id_empleado is not None:
+        try:
+            descontar_inventario(
+                conn,
+                id_orden=int(fila["id_orden"]),
+                partidas=[
+                    {
+                        "id_producto": int(fila["id_producto"]),
+                        "cantidad": int(fila["cantidad"]),
+                    }
+                ],
+                id_empleado=id_empleado,
             )
-        ).scalar_one_or_none()
-        if id_pendiente is None:
-            raise MermaError("Falta el estado 'Pendiente' en el catálogo.")
+        except StockInsuficienteError as exc:
+            raise MermaError(
+                "No se puede repetir la partida: " + str(exc)
+            ) from exc
 
-        comentario = conn.execute(
+    if str(fila["estado_orden"]) not in ("Pagada", "Cancelada"):
+        recalcular_total_orden(conn, int(fila["id_orden"]))
+
+    return id_nuevo
+
+
+def repetir_detalle_mermado(*, id_detalle: int) -> int:
+    """Clona una partida mermada y descuenta la receta de la reposición."""
+    with transaccion() as conn:
+        empleado = conn.execute(
             text(
                 """
-                SELECT id_usuario, datos_nuevos ->> 'comentario' AS comentario
+                SELECT (datos_nuevos ->> 'id_empleado')::int AS id_empleado
                 FROM auditoria
-                WHERE tabla_afectada = 'detalles_orden_comentario'
-                  AND id_registro_afectado = :detalle
+                WHERE tabla_afectada = :tabla
+                  AND (datos_nuevos ->> 'id_detalle')::int = :detalle
                 ORDER BY id_auditoria DESC
                 LIMIT 1
                 """
             ),
-            {"detalle": int(id_detalle)},
-        ).mappings().first()
-
-        id_nuevo = conn.execute(
-            text(
-                """
-                INSERT INTO detalles_orden
-                    (id_orden, id_producto, cantidad, precio_unitario,
-                     id_area_preparacion, id_estado)
-                VALUES (:orden, :producto, :cantidad, :precio, :area, :estado)
-                RETURNING id_detalle
-                """
-            ),
-            {
-                "orden": int(fila["id_orden"]),
-                "producto": int(fila["id_producto"]),
-                "cantidad": int(fila["cantidad"]),
-                "precio": fila["precio_unitario"],
-                "area": int(fila["id_area_preparacion"]),
-                "estado": int(id_pendiente),
-            },
-        ).scalar_one()
-
-        if comentario and (comentario["comentario"] or "").strip():
-            conn.execute(
-                text(
-                    """
-                    INSERT INTO auditoria
-                        (id_usuario, tabla_afectada, id_registro_afectado,
-                         accion, datos_nuevos)
-                    VALUES (:usuario, 'detalles_orden_comentario', :detalle,
-                            'INSERT', CAST(:datos AS jsonb))
-                    """
-                ),
-                {
-                    "usuario": comentario["id_usuario"],
-                    "detalle": int(id_nuevo),
-                    "datos": json.dumps(
-                        {"comentario": comentario["comentario"]},
-                        ensure_ascii=False,
-                    ),
-                },
+            {"tabla": TABLA_MERMA_PENDIENTE, "detalle": int(id_detalle)},
+        ).scalar()
+        if empleado is None:
+            raise MermaError(
+                "No se encontró el empleado que reportó la merma; "
+                "no se puede descontar la reposición."
             )
-
-        if str(fila["estado_orden"]) not in ("Pagada", "Cancelada"):
-            recalcular_total_orden(conn, int(fila["id_orden"]))
-
-    return int(id_nuevo)
+        return _repetir_detalle_en(
+            conn, int(id_detalle), id_empleado=int(empleado)
+        )
 
 
 def registrar_merma_producto(
@@ -524,6 +627,8 @@ def registrar_merma_producto(
             id_usuario=id_usuario,
             id_empleado=id_empleado,
             nombre_tipo_merma="Merma de cocina",
+            origen_tipo="producto",
+            reporte=f"producto-{time.time_ns()}",
         )
 
 
@@ -537,9 +642,10 @@ def registrar_merma_insumo(
 ) -> list[int]:
     """Captura una merma general de un insumo base, sin orden asociada.
 
-    No descuenta stock al reportar: crea el movimiento y la fila en ``mermas``
-    pendientes. El Gerente la sube desde Inventario, donde se descuenta
-    directamente ``insumos.stock_actual`` y se fija el costo de la pérdida.
+    No descuenta stock al reportar: crea la fila en ``mermas`` con
+    ``id_movimiento = NULL`` y su marca de auditoría. El Gerente la sube desde
+    Inventario, donde se inserta el movimiento tipo ``Merma``, se descuenta
+    ``insumos.stock_actual`` y se fija el costo de la pérdida.
     """
     motivo = (motivo or "").strip()
     if not motivo:
@@ -569,31 +675,7 @@ def registrar_merma_insumo(
         if insumo is None:
             raise MermaError("El insumo seleccionado no existe o está inactivo.")
 
-        id_tipo_movimiento = _id_tipo_movimiento_merma(conn)
         id_tipo_merma = _id_tipo_merma(conn, "Otro")
-        referencia = f" general-{time.time_ns()}"
-        motivo_movimiento = _truncar(
-            f"{PREFIJO_INSUMO}{referencia} | {insumo['nombre']} | {motivo}",
-            150,
-        )
-        movimiento = conn.execute(
-            text(
-                """
-                INSERT INTO movimientos_inventario
-                    (id_insumo, id_tipo_movimiento, cantidad, motivo,
-                     id_empleado, id_orden)
-                VALUES (:insumo, :tipo, :cantidad, :motivo, :empleado, NULL)
-                RETURNING id_movimiento
-                """
-            ),
-            {
-                "insumo": int(insumo["id_insumo"]),
-                "tipo": id_tipo_movimiento,
-                "cantidad": cantidad,
-                "motivo": motivo_movimiento,
-                "empleado": id_empleado,
-            },
-        )
         descripcion = _truncar(
             f"Insumo: {insumo['nombre']} | Motivo: {motivo}", 255
         )
@@ -603,17 +685,51 @@ def registrar_merma_insumo(
                 INSERT INTO mermas
                     (id_movimiento, id_tipo_merma, id_empleado_responsable,
                      id_usuario_registro, descripcion)
-                VALUES (:movimiento, :tipo, :empleado, :usuario, :descripcion)
+                VALUES (NULL, :tipo, :empleado, :usuario, :descripcion)
                 RETURNING id_merma
                 """
             ),
             {
-                "movimiento": int(movimiento.scalar_one()),
                 "tipo": id_tipo_merma,
                 "empleado": id_empleado,
                 "usuario": id_usuario,
                 "descripcion": descripcion,
             },
         ).scalar_one()
+        id_merma = int(id_merma)
 
-    return [int(id_merma)]
+        conn.execute(
+            text(
+                """
+                INSERT INTO auditoria
+                    (id_usuario, tabla_afectada, id_registro_afectado,
+                     accion, datos_nuevos)
+                VALUES (:usuario, :tabla, :merma, 'INSERT',
+                        CAST(:datos AS jsonb))
+                """
+            ),
+            {
+                "usuario": id_usuario,
+                "tabla": TABLA_MERMA_PENDIENTE,
+                "merma": id_merma,
+                "datos": json.dumps(
+                    {
+                        "id_merma": id_merma,
+                        "id_insumo": int(insumo["id_insumo"]),
+                        "insumo": insumo["nombre"],
+                        "cantidad": str(cantidad),
+                        "id_orden": None,
+                        "id_detalle": None,
+                        "origen": "insumo",
+                        "reporte": f"insumo-{time.time_ns()}",
+                        "motivo": motivo,
+                        "producto": insumo["nombre"],
+                        "id_empleado": id_empleado,
+                        "tipo_merma": "Otro",
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        )
+
+    return [id_merma]

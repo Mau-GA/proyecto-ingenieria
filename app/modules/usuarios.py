@@ -3,14 +3,52 @@ from datetime import date
 
 import bcrypt
 import streamlit as st
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
-from database import run_query, execute
+from database import run_query, execute, transaccion
 from permissions import requerir_rol, requerir_accion, ADMIN, GERENTE
 
 
 def _hash_password(password_plano: str) -> str:
     return bcrypt.hashpw(password_plano.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def _crear_usuario_con_roles(
+    *,
+    id_empleado: int | None,
+    nombre_usuario: str,
+    correo: str | None,
+    password_hash: str,
+    ids_roles: list[int],
+) -> int:
+    """Crea usuario y roles en una sola transacción."""
+    with transaccion() as conn:
+        id_usuario = conn.execute(
+            text(
+                """
+                INSERT INTO usuarios
+                    (id_empleado, nombre_usuario, correo, password_hash)
+                VALUES (:emp, :u, :c, :p)
+                RETURNING id_usuario
+                """
+            ),
+            {
+                "emp": id_empleado,
+                "u": nombre_usuario,
+                "c": correo,
+                "p": password_hash,
+            },
+        ).scalar_one()
+        for id_rol in ids_roles:
+            conn.execute(
+                text(
+                    "INSERT INTO usuarios_roles (id_usuario, id_rol) "
+                    "VALUES (:u, :r)"
+                ),
+                {"u": int(id_usuario), "r": int(id_rol)},
+            )
+    return int(id_usuario)
 
 
 def _render_gestion_empleados() -> None:
@@ -164,24 +202,32 @@ def _render_gestion_cuentas() -> None:
         st.error("Asigna al menos un rol.")
         return
 
-    id_usuario = execute(
-        """
-        INSERT INTO usuarios (id_empleado, nombre_usuario, correo, password_hash)
-        VALUES (:emp, :u, :c, :p)
-        RETURNING id_usuario
-        """,
-        {
-            "emp": empleado["id_empleado"],
-            "u": nombre_usuario.strip(),
-            "c": correo.strip() or None,
-            "p": _hash_password(password),
-        },
-    )
-    for rol in roles_sel:
-        execute(
-            "INSERT INTO usuarios_roles (id_usuario, id_rol) VALUES (:u, :r)",
-            {"u": id_usuario, "r": int(rol["id_rol"])},
+    password_hash = _hash_password(password)
+    try:
+        _crear_usuario_con_roles(
+            id_empleado=empleado["id_empleado"],
+            nombre_usuario=nombre_usuario.strip(),
+            correo=correo.strip() or None,
+            password_hash=password_hash,
+            ids_roles=[int(rol["id_rol"]) for rol in roles_sel],
         )
+    except IntegrityError as exc:
+        origen = getattr(exc, "orig", None)
+        codigo = getattr(origen, "pgcode", None)
+        restriccion = getattr(getattr(origen, "diag", None), "constraint_name", None)
+        if codigo == "23505" and restriccion == "uq_usuario_nombre":
+            st.error("Ya existe un usuario con ese nombre.")
+        elif codigo == "23505" and restriccion == "uq_usuario_correo":
+            st.error("Ya existe un usuario con ese correo.")
+        elif codigo == "23505" and restriccion == "uq_usuario_empleado":
+            st.error("Ese empleado ya tiene una cuenta de usuario.")
+        else:
+            st.error("No se pudo crear el usuario: revisa los roles asignados.")
+        return
+    except SQLAlchemyError as exc:
+        st.error(f"No se pudo crear el usuario: {exc}")
+        return
+
     st.success(f"Usuario '{nombre_usuario}' creado.")
     st.rerun()
 

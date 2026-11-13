@@ -1,6 +1,6 @@
 # PASOS — Compilar y ejecutar `proyectorestaurante`
 
-Guía para levantar el sistema completo (Streamlit + MariaDB en Docker) en
+Guía para levantar el sistema completo (Streamlit + PostgreSQL en Docker) en
 **Ubuntu/Linux**, desde cero. Ejecuta los bloques en orden.
 
 > Ruta de ejemplo usada en toda la guía: `~/Ing_soft/proyectorestaurante`.
@@ -14,7 +14,7 @@ Guía para levantar el sistema completo (Streamlit + MariaDB en Docker) en
 proyectorestaurante/
 ├── PASOS.md                  ← esta guía
 ├── README.md                 ← documentación del diseño
-├── docker-compose.yml        ← servicios db (MariaDB 11.4) + app (Streamlit)
+├── docker-compose.yml        ← servicios db (PostgreSQL 16) + app (Streamlit)
 ├── Dockerfile                ← imagen de la app (python:3.11-slim)
 ├── requirements.txt          ← dependencias Python fijadas
 ├── .env.example              ← plantilla de variables (copiar a .env)
@@ -97,12 +97,12 @@ En `.env` cambia **como mínimo**:
 
 | Variable              | Qué poner                                         |
 |-----------------------|---------------------------------------------------|
-| `MYSQL_ROOT_PASSWORD` | contraseña larga para root de MariaDB             |
+| `MYSQL_USER`          | usuario de la app y superusuario inicial de PostgreSQL |
 | `MYSQL_PASSWORD`      | contraseña del usuario de la app                  |
 | `SECRET_KEY`          | la cadena que generaste arriba                    |
 
 > `MYSQL_HOST` y `MYSQL_PORT` del `.env` **no afectan a Docker**
-> (docker-compose fuerza `db:3306`). Solo sirven si corres la app sin Docker (paso 10).
+> (docker-compose fuerza `db:5432`). Solo sirven si corres la app sin Docker (paso 10).
 
 Guarda con `Ctrl+O`, `Enter`, sale con `Ctrl+X`.
 
@@ -117,7 +117,7 @@ docker compose up -d --build
 
 Qué pasa:
 1. Se construye la imagen `app` (instala `requirements.txt`; la primera vez tarda 1–3 min).
-2. Arranca MariaDB. **Solo en el primer arranque** (volumen vacío) ejecuta
+2. Arranca PostgreSQL. **Solo en el primer arranque** (volumen vacío) ejecuta
    `db/schema.sql` y luego `db/seed.sql`.
 3. La app espera a que la BD esté `healthy` y entonces arranca Streamlit.
 
@@ -147,7 +147,7 @@ docker compose logs -f app     # errores de Python/Streamlit
 Comprobar que la BD se cargó:
 
 ```bash
-docker compose exec db sh -c 'mariadb -u"$MARIADB_USER" -p"$MARIADB_PASSWORD" "$MARIADB_DATABASE" -e "SELECT COUNT(*) AS productos FROM productos; SELECT COUNT(*) AS ordenes FROM ordenes;"'
+docker compose exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT COUNT(*) AS productos FROM productos; SELECT COUNT(*) AS ordenes FROM ordenes;"'
 ```
 
 Debe mostrar `productos = 10` y `ordenes = 18`.
@@ -224,10 +224,10 @@ docker compose up -d --build app     # recompilar tras cambiar requirements.txt
 
 ```bash
 mkdir -p ~/Ing_soft/respaldos
-docker compose exec -T db sh -c 'mariadb-dump -u"$MARIADB_USER" -p"$MARIADB_PASSWORD" "$MARIADB_DATABASE"' \
+docker compose exec -T db sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists' \
   > ~/Ing_soft/respaldos/restaurante_$(date +%F).sql
 
-docker compose exec -T db sh -c 'mariadb -u"$MARIADB_USER" -p"$MARIADB_PASSWORD" "$MARIADB_DATABASE"' \
+docker compose exec -T db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
   < ~/Ing_soft/respaldos/restaurante_AAAA-MM-DD.sql
 ```
 
@@ -259,7 +259,7 @@ streamlit run app.py                          # usa MYSQL_HOST=127.0.0.1 y MYSQL
 
 ## 11. Conectarse con DBeaver
 
-Nueva conexión → **MariaDB**:
+Nueva conexión → **PostgreSQL**:
 
 | Campo        | Valor                                   |
 |--------------|-----------------------------------------|
@@ -276,12 +276,12 @@ El puerto solo escucha en `127.0.0.1` (no queda expuesto a la red local).
 
 | Síntoma | Causa / solución |
 |---|---|
-| `Define MYSQL_ROOT_PASSWORD en .env` al hacer `up` | No existe `.env` o le falta la variable → paso 3. |
+| `Define MYSQL_DATABASE en .env` al hacer `up` | No existe `.env` o le falta la variable → paso 3. |
 | `port is already allocated` (3307 u 8501) | Otro servicio usa el puerto. Cambia `MYSQL_EXPOSED_PORT` o `APP_PORT` en `.env`. |
 | La app dice “No hay conexión con la base de datos” | La BD aún inicializa; espera 30 s y recarga. Si persiste: `docker compose logs db`. |
 | Cambié `schema.sql`/`seed.sql` y no se refleja | Solo corren con el volumen vacío → `docker compose down -v` (borra datos). |
 | “Usuario o contraseña incorrectos” con `admin` | Falta el paso 6. |
 | “Tu usuario no está vinculado a una ficha de empleado” | Los movimientos de inventario exigen empleado. Crea el usuario en **Usuarios** vinculándolo a un empleado. |
 | “No se registró la venta: no alcanza el inventario” | Registra una **Compra** o un **Ajuste positivo** del insumo indicado. |
-| Al abrir una mesa en **Órdenes** aparece una cuenta con importe previo | Las órdenes históricas del seed están en estado *Entregada* (no final), así que cuentan como abiertas. Para cerrarlas: `UPDATE ordenes SET id_estado = 5 WHERE id_orden <= 18 AND id_estado = 4;` |
+| Al abrir una mesa en **Órdenes** aparece una cuenta con importe previo | El seed ya deja las órdenes históricas como `Pagada` o `Cancelada`; si ves cuentas abiertas, revisa que hayas recreado el volumen con `docker compose down -v`. |
 | `permission denied ... docker.sock` | Falta `sudo usermod -aG docker $USER` y volver a iniciar sesión. |

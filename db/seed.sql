@@ -241,7 +241,7 @@ INSERT INTO detalle_compra (id_detalle_compra, id_compra, id_insumo, cantidad, c
 -- ---------------------------------------------------------------------
 INSERT INTO mesas (id_mesa, numero_mesa, capacidad, estado) VALUES
 (1, 1, 4, 'Disponible'),
-(2, 2, 4, 'Ocupada'),
+(2, 2, 4, 'Disponible'),
 (3, 3, 6, 'Disponible'),
 (4, 4, 2, 'Disponible'),
 (5, 5, 8, 'Disponible');
@@ -249,57 +249,40 @@ INSERT INTO mesas (id_mesa, numero_mesa, capacidad, estado) VALUES
 -- ---------------------------------------------------------------------
 -- B.6 Órdenes, detalle y pagos
 -- ---------------------------------------------------------------------
--- ADVERTENCIA DE MIGRACIÓN: `ordenes.total` en el dump original no coincide
--- con SUM(detalles_orden.subtotal) en NINGUNA de las 18 órdenes. Se recalcula
--- el total a partir de las partidas (regla auditable y documentada) excepto
--- en la orden 18, que no tiene ninguna partida en `detalles_orden`: ahí se
--- conserva el total original porque no hay forma de recalcularlo sin
--- inventar datos. Ver MIGRACION.md para el detalle fila por fila y para la
--- anomalía detectada en `pagos.id_orden` (los montos coinciden sistemáticamente
--- con el total de la orden SIGUIENTE, lo que sugiere un desfase de captura).
+-- Datos históricos normalizados para que la BD inicial sea coherente:
+-- las órdenes con partidas y pago quedan 'Pagada' (5); las órdenes 2 y 18,
+-- sin cobro válido o sin partidas, quedan 'Cancelada' (6). El total de cada
+-- orden coincide con SUM(detalles_orden.subtotal) y con sus pagos.
 --
 -- id_tipo_orden = 1 (Local) para todas: en el dump original toda orden con
 -- id_mesa tiene mesa asignada, y no existían pedidos para llevar/plataforma.
 -- id_usuario_registro = 1 (admin bootstrap): el dump no tenía concepto de
 -- usuario/sesión, solo de mesero (id_empleado_atiende).
-INSERT INTO ordenes (id_orden, id_tipo_orden, id_mesa, id_cliente, id_empleado_atiende, id_usuario_registro, fecha_orden, id_estado, total) VALUES
-(1,  1, 1, 1, 1, 1, '2025-05-15 14:00:00', 5, 310.00), -- original: 300.00
-(2,  1, 2, 2, 2, 1, '2025-05-15 15:30:00', 2, 185.00), -- original: 215.00
-(3,  1, 3, 3, 3, 1, '2026-05-23 11:29:00', 4, 310.00), -- original: 545.00
-(4,  1, 3, 3, 3, 1, '2026-05-23 11:29:00', 4, 255.00), -- original: 320.00
-(5,  1, 1, 2, 1, 1, '2026-05-23 12:10:00', 4, 390.00), -- original: 275.00
-(6,  1, 4, 4, 2, 1, '2026-05-23 13:05:00', 4, 180.00), -- original: 410.00
-(7,  1, 5, 5, 1, 1, '2026-05-23 14:20:00', 4, 510.00), -- original: 180.00
-(8,  1, 2, 1, 2, 1, '2026-05-23 15:40:00', 4, 400.00), -- original: 520.00
-(9,  1, 1, 3, 1, 1, '2026-05-24 10:15:00', 4, 205.00), -- original: 250.00
-(10, 1, 2, 2, 2, 1, '2026-05-24 11:50:00', 4, 360.00), -- original: 340.00
-(11, 1, 3, 5, 1, 1, '2026-05-24 13:30:00', 4, 165.00), -- original: 460.00
-(12, 1, 4, 1, 2, 1, '2026-05-24 16:10:00', 4, 570.00), -- original: 210.00
-(13, 1, 5, 4, 1, 1, '2026-05-24 18:25:00', 4, 320.00), -- original: 390.00
-(14, 1, 2, 5, 2, 1, '2026-05-25 09:45:00', 4, 180.00), -- original: 150.00
-(15, 1, 1, 1, 1, 1, '2026-05-25 12:00:00', 4, 470.00), -- original: 620.00
-(16, 1, 3, 2, 3, 1, '2026-05-25 13:40:00', 4, 380.00), -- original: 310.00
-(17, 1, 5, 4, 2, 1, '2026-05-25 17:15:00', 4, 390.00), -- original: 280.00
-(18, 1, 4, 3, 1, 1, '2026-05-25 20:05:00', 4, 490.00); -- original: 490.00 (SIN partidas en detalles_orden: revisar manualmente, ver MIGRACION.md)
+INSERT INTO ordenes (id_orden, id_tipo_orden, id_mesa, id_cliente, id_empleado_atiende, id_usuario_registro, fecha_orden, id_estado, total, numero_orden_diaria) VALUES
+(1,  1, 1, 1, 1, 1, '2025-05-15 14:00:00', 5, 310.00, 1),
+(2,  1, 2, 2, 2, 1, '2025-05-15 15:30:00', 6, 185.00, 2),
+(3,  1, 3, 3, 3, 1, '2026-05-23 11:29:00', 5, 310.00, 1),
+(4,  1, 3, 3, 3, 1, '2026-05-23 11:29:00', 5, 255.00, 2),
+(5,  1, 1, 2, 1, 1, '2026-05-23 12:10:00', 5, 390.00, 3),
+(6,  1, 4, 4, 2, 1, '2026-05-23 13:05:00', 5, 180.00, 4),
+(7,  1, 5, 5, 1, 1, '2026-05-23 14:20:00', 5, 510.00, 5),
+(8,  1, 2, 1, 2, 1, '2026-05-23 15:40:00', 5, 400.00, 6),
+(9,  1, 1, 3, 1, 1, '2026-05-24 10:15:00', 5, 205.00, 1),
+(10, 1, 2, 2, 2, 1, '2026-05-24 11:50:00', 5, 360.00, 2),
+(11, 1, 3, 5, 1, 1, '2026-05-24 13:30:00', 5, 165.00, 3),
+(12, 1, 4, 1, 2, 1, '2026-05-24 16:10:00', 5, 570.00, 4),
+(13, 1, 5, 4, 1, 1, '2026-05-24 18:25:00', 5, 320.00, 5),
+(14, 1, 2, 5, 2, 1, '2026-05-25 09:45:00', 5, 180.00, 1),
+(15, 1, 1, 1, 1, 1, '2026-05-25 12:00:00', 5, 470.00, 2),
+(16, 1, 3, 2, 3, 1, '2026-05-25 13:40:00', 5, 380.00, 3),
+(17, 1, 5, 4, 2, 1, '2026-05-25 17:15:00', 5, 390.00, 4),
+(18, 1, 4, 3, 1, 1, '2026-05-25 20:05:00', 6, 0.00, 5);
 
--- Consecutivo diario visible: se asigna por fecha de la orden y por el
--- orden de captura (id_orden), reiniciando en 1 para cada día.
-UPDATE ordenes o
-SET numero_orden_diaria = sub.numero
-FROM (
-    SELECT id_orden,
-           ROW_NUMBER() OVER (PARTITION BY DATE(fecha_orden) ORDER BY id_orden) AS numero
-    FROM ordenes
-) sub
-WHERE o.id_orden = sub.id_orden;
-
--- La columna queda obligatoria para que toda orden nueva tenga su número
--- visible; la aplicación lo asigna al crear la orden.
-ALTER TABLE ordenes ALTER COLUMN numero_orden_diaria SET NOT NULL;
+-- El número visible se asigna en el INSERT (columna NOT NULL en schema).
 
 INSERT INTO detalles_orden (id_orden, id_producto, cantidad, precio_unitario, id_area_preparacion, id_estado) VALUES
 (1, 1, 2, 120.00, 1, 4), (1, 7, 2, 35.00, 2, 4),
-(2, 4, 1, 140.00, 1, 2), (2, 8, 1, 45.00, 2, 2),
+(2, 4, 1, 140.00, 1, 4), (2, 8, 1, 45.00, 2, 4),
 (3, 1, 2, 120.00, 1, 4), (3, 7, 2, 35.00, 2, 4),
 (4, 4, 1, 140.00, 1, 4), (4, 9, 1, 70.00, 2, 4), (4, 8, 1, 45.00, 2, 4),
 (5, 3, 2, 155.00, 1, 4), (5, 10, 2, 40.00, 2, 4),
@@ -315,34 +298,29 @@ INSERT INTO detalles_orden (id_orden, id_producto, cantidad, precio_unitario, id
 (15, 5, 3, 145.00, 1, 4), (15, 7, 1, 35.00, 2, 4),
 (16, 1, 2, 120.00, 1, 4), (16, 9, 2, 70.00, 2, 4),
 (17, 3, 2, 155.00, 1, 4), (17, 10, 2, 40.00, 2, 4);
--- La orden 18 se queda intencionalmente sin partidas (ver advertencia arriba).
+-- La orden 18 se queda intencionalmente sin partidas: está cancelada y su total es 0.
 
--- ADVERTENCIA DE MIGRACIÓN: se detectó que `pagos.id_orden` en el dump
--- original parece estar desfasado en una posición: el monto de cada pago
--- (a partir del segundo) coincide con el total ORIGINAL de la orden
--- siguiente a la referenciada, no con la orden indicada. Se cargan los
--- datos EXACTAMENTE como están en el dump (sin reasignar id_orden) porque
--- corregirlo requiere juicio de negocio (saber qué orden cobró realmente
--- cada pago). Revisar manualmente antes de usar estos registros para
--- conciliación financiera real. Ver MIGRACION.md.
+-- Pagos ajustados al total de su propia orden, de modo que las órdenes
+-- 'Pagada' cuadren con SUM(pagos.monto). Las órdenes 2 y 18 son canceladas
+-- y no tienen pago: la orden 2 no lo tenía en el dump y la 18 carece de
+-- partidas para respaldar un cobro.
 INSERT INTO pagos (id_orden, id_metodo_pago, monto, fecha_pago, referencia_pago, id_usuario_registro) VALUES
 (1,  1, 310.00, '2025-05-15 14:45:00', 'PAGO001', 1),
-(3,  2, 320.00, '2026-05-23 11:50:00', 'PAGO003', 1),
-(4,  1, 275.00, '2026-05-23 12:40:00', 'PAGO004', 1),
-(5,  3, 410.00, '2026-05-23 13:30:00', 'PAGO005', 1),
+(3,  2, 310.00, '2026-05-23 11:50:00', 'PAGO003', 1),
+(4,  1, 255.00, '2026-05-23 12:40:00', 'PAGO004', 1),
+(5,  3, 390.00, '2026-05-23 13:30:00', 'PAGO005', 1),
 (6,  1, 180.00, '2026-05-23 14:45:00', 'PAGO006', 1),
-(7,  2, 520.00, '2026-05-23 16:00:00', 'PAGO007', 1),
-(8,  2, 250.00, '2026-05-24 10:40:00', 'PAGO008', 1),
-(9,  1, 340.00, '2026-05-24 12:10:00', 'PAGO009', 1),
-(10, 3, 460.00, '2026-05-24 14:00:00', 'PAGO010', 1),
-(11, 1, 210.00, '2026-05-24 16:30:00', 'PAGO011', 1),
-(12, 2, 390.00, '2026-05-24 18:50:00', 'PAGO012', 1),
-(13, 1, 150.00, '2026-05-25 10:00:00', 'PAGO013', 1),
-(14, 2, 620.00, '2026-05-25 12:30:00', 'PAGO014', 1),
-(15, 3, 310.00, '2026-05-25 14:00:00', 'PAGO015', 1),
-(16, 1, 280.00, '2026-05-25 17:40:00', 'PAGO016', 1),
-(17, 2, 490.00, '2026-05-25 20:30:00', 'PAGO017', 1);
--- Nótese que no existe ningún pago con id_orden = 2 en el dump original.
+(7,  2, 510.00, '2026-05-23 16:00:00', 'PAGO007', 1),
+(8,  2, 400.00, '2026-05-24 10:40:00', 'PAGO008', 1),
+(9,  1, 205.00, '2026-05-24 12:10:00', 'PAGO009', 1),
+(10, 3, 360.00, '2026-05-24 14:00:00', 'PAGO010', 1),
+(11, 1, 165.00, '2026-05-24 16:30:00', 'PAGO011', 1),
+(12, 2, 570.00, '2026-05-24 18:50:00', 'PAGO012', 1),
+(13, 1, 320.00, '2026-05-25 10:00:00', 'PAGO013', 1),
+(14, 2, 180.00, '2026-05-25 12:30:00', 'PAGO014', 1),
+(15, 3, 470.00, '2026-05-25 14:00:00', 'PAGO015', 1),
+(16, 1, 380.00, '2026-05-25 17:40:00', 'PAGO016', 1),
+(17, 2, 390.00, '2026-05-25 20:30:00', 'PAGO017', 1);
 
 -- ---------------------------------------------------------------------
 -- B.7 Movimientos de inventario

@@ -13,3 +13,6 @@ runOnSave = true
 
 [browser]
 gatherUsageStats = false
+
+[client]
+showErrorDetails = false

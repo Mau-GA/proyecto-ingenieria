@@ -152,7 +152,7 @@ def main():
         st.error("No hay conexión con la base de datos.")
         st.code(msg)
         st.info("Revisa `docker compose ps` y `docker compose logs db`. "
-                "En el primer arranque MariaDB tarda unos segundos en inicializarse.")
+                "En el primer arranque PostgreSQL tarda unos segundos en inicializarse.")
         st.stop()
 
     if not esta_autenticado():

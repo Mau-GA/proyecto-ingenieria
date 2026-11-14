@@ -29,12 +29,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Connection
 
-from database import transaccion
+from database import get_engine, transaccion
 
 CERO = Decimal("0")
 
@@ -215,6 +215,61 @@ def calcular_consumo(conn: Connection, partidas: list[dict]) -> dict[int, Decima
     return consumo
 
 
+def porciones_disponibles(
+    conn_o_none: Connection | None,
+) -> dict[int, int | None]:
+    """Porciones que alcanzan por producto con el stock actual.
+
+    Para cada producto con receta se toma el mínimo de
+    ``floor(stock_actual / cantidad_usada)`` entre todos sus insumos. Un
+    producto sin receta regresa ``None`` (sin límite calculable). Esta lectura
+    es solo informativa: la validación definitiva sigue siendo la de
+    ``descontar_inventario`` con ``FOR UPDATE``.
+    """
+
+    def _calcular(conn: Connection) -> dict[int, int | None]:
+        productos = conn.execute(
+            text("SELECT id_producto FROM productos")
+        ).scalars().all()
+        resultado: dict[int, int | None] = {
+            int(id_producto): None for id_producto in productos
+        }
+
+        filas = conn.execute(
+            text(
+                """
+                SELECT r.id_producto, r.cantidad_usada, i.stock_actual
+                FROM recetas r
+                JOIN insumos i ON i.id_insumo = r.id_insumo
+                """
+            )
+        ).all()
+        limites: dict[int, int] = {}
+        for id_producto, cantidad_usada, stock_actual in filas:
+            cantidad = Decimal(str(cantidad_usada))
+            if cantidad <= 0:
+                continue
+            porciones = int(
+                (Decimal(str(stock_actual)) / cantidad).to_integral_value(
+                    rounding=ROUND_FLOOR
+                )
+            )
+            id_producto = int(id_producto)
+            if id_producto in limites:
+                limites[id_producto] = min(limites[id_producto], porciones)
+            else:
+                limites[id_producto] = porciones
+
+        for id_producto, porciones in limites.items():
+            resultado[id_producto] = max(0, porciones)
+        return resultado
+
+    if conn_o_none is None:
+        with get_engine().connect() as conn:
+            return _calcular(conn)
+    return _calcular(conn_o_none)
+
+
 def descontar_inventario(
     conn: Connection,
     *,
@@ -306,11 +361,19 @@ def _revertir_inventario(
     id_orden: int,
     partida: dict,
     id_empleado: int | None,
+    motivo: str | None = None,
 ) -> None:
-    """Devuelve al stock los insumos de una partida eliminada.
+    """Devuelve al stock los insumos de una partida eliminada o reducida.
 
     Se registra un movimiento de 'Ajuste positivo' para conservar el historial
-    completo; no se borra el movimiento de salida original.
+    completo; no se borra el movimiento de salida original. ``motivo`` permite
+    distinguir una eliminación de una reducción de cantidad.
+
+    Limitación conocida: el consumo se calcula con la receta vigente, no con
+    una foto histórica. Si la receta cambió entre la venta y esta reversa, la
+    cantidad devuelta puede diferir de la descontada originalmente. Corregirlo
+    requeriría guardar la receta aplicada por partida (cambio de esquema), por
+    lo que en esta fase solo se documenta.
     """
     consumo = calcular_consumo(conn, [partida])
     if not consumo:
@@ -336,7 +399,8 @@ def _revertir_inventario(
                 "insumo": i,
                 "tipo": id_tipo,
                 "cantidad": cant,
-                "motivo": f"Reversa por eliminación de partida de la orden #{id_orden}",
+                "motivo": motivo
+                or f"Reversa por eliminación de partida de la orden #{id_orden}",
                 "empleado": id_empleado,
                 "orden": id_orden,
             }
@@ -637,8 +701,9 @@ def eliminar_partida(
     id_usuario: int,
     id_empleado: int | None,
 ) -> Decimal:
-    """Elimina un producto de una orden abierta y recalcula su total.
+    """Elimina una partida Pendiente de una orden abierta y recalcula su total.
 
+    Solo se permite mientras cocina/bar no hayan empezado la preparación.
     También devuelve al inventario los insumos que esa partida había
     descontado, para que la eliminación no deje consumos fantasma.
     """
@@ -646,18 +711,25 @@ def eliminar_partida(
         fila = conn.execute(
             text(
                 """
-                SELECT d.id_orden, d.id_producto, d.cantidad, o.id_mesa
+                SELECT d.id_orden, d.id_producto, d.cantidad, o.id_mesa,
+                       ed.nombre AS estado_detalle
                 FROM detalles_orden d
                 JOIN ordenes o ON o.id_orden = d.id_orden
                 JOIN estados_orden e ON e.id_estado = o.id_estado
+                JOIN estados_detalle_orden ed ON ed.id_estado = d.id_estado
                 WHERE d.id_detalle = :detalle AND e.es_final = FALSE
-                FOR UPDATE
+                FOR UPDATE OF d, o
                 """
             ),
             {"detalle": id_detalle},
         ).mappings().first()
         if fila is None:
             raise VentaError("La partida no existe o la orden ya está cerrada.")
+        if str(fila["estado_detalle"]) != "Pendiente":
+            raise VentaError(
+                "Este producto ya está en preparación; si se perdió, "
+                "repórtalo como merma."
+            )
 
         id_orden = int(fila["id_orden"])
         _revertir_inventario(
@@ -701,6 +773,90 @@ def eliminar_partida(
     return total
 
 
+def modificar_cantidad_partida(
+    id_detalle: int,
+    nueva_cantidad: int,
+    id_usuario: int,
+    id_empleado: int | None,
+) -> Decimal:
+    """Cambia la cantidad de una partida Pendiente y ajusta su inventario.
+
+    Solo se permite mientras cocina/bar no hayan empezado la preparación.
+    La diferencia de consumo se calcula contra la receta vigente y se aplica
+    en la misma transacción: si al subir la cantidad falta stock, hace ROLLBACK
+    completo. Al bajar, devuelve los insumos con un movimiento de entrada.
+    """
+    try:
+        nueva = int(nueva_cantidad)
+    except (TypeError, ValueError) as exc:
+        raise VentaError("La cantidad debe ser un número entero.") from exc
+    if nueva < 1:
+        raise VentaError("La cantidad debe ser al menos 1.")
+
+    with transaccion() as conn:
+        fila = conn.execute(
+            text(
+                """
+                SELECT d.id_orden, d.id_producto, d.cantidad,
+                       ed.nombre AS estado_detalle, e.es_final
+                FROM detalles_orden d
+                JOIN ordenes o ON o.id_orden = d.id_orden
+                JOIN estados_orden e ON e.id_estado = o.id_estado
+                JOIN estados_detalle_orden ed ON ed.id_estado = d.id_estado
+                WHERE d.id_detalle = :detalle
+                FOR UPDATE OF d, o
+                """
+            ),
+            {"detalle": int(id_detalle)},
+        ).mappings().first()
+        if fila is None or bool(fila["es_final"]):
+            raise VentaError("La partida no existe o la orden ya está cerrada.")
+        if str(fila["estado_detalle"]) != "Pendiente":
+            raise VentaError(
+                "Este producto ya está en preparación; si se perdió, "
+                "repórtalo como merma."
+            )
+
+        id_orden = int(fila["id_orden"])
+        id_producto = int(fila["id_producto"])
+        actual = int(fila["cantidad"])
+        diferencia = nueva - actual
+
+        if diferencia > 0:
+            descontar_inventario(
+                conn,
+                id_orden=id_orden,
+                partidas=[{"id_producto": id_producto, "cantidad": diferencia}],
+                id_empleado=id_empleado,
+            )
+        elif diferencia < 0:
+            _revertir_inventario(
+                conn,
+                id_orden=id_orden,
+                partida={
+                    "id_producto": id_producto,
+                    "cantidad": abs(diferencia),
+                },
+                id_empleado=id_empleado,
+                motivo=(
+                    "Reversa por reducción de cantidad en la orden "
+                    f"#{id_orden}"
+                ),
+            )
+
+        if diferencia != 0:
+            conn.execute(
+                text(
+                    "UPDATE detalles_orden SET cantidad = :n "
+                    "WHERE id_detalle = :detalle"
+                ),
+                {"n": nueva, "detalle": int(id_detalle)},
+            )
+
+        total = recalcular_total_orden(conn, id_orden)
+    return total
+
+
 def limpiar_comandas_listas() -> int:
     """Pasa todas las partidas en ``Listo`` a ``Entregado`` en una transacción."""
     with transaccion() as conn:
@@ -730,19 +886,19 @@ def cobrar_orden_mesa(*, id_orden: int, id_mesa: int | None, id_metodo_pago: int
     with transaccion() as conn:
         orden = conn.execute(
             text(
-                """
-                SELECT o.total, e.es_final
-                FROM ordenes o
-                JOIN estados_orden e ON e.id_estado = o.id_estado
-                WHERE o.id_orden = :o
-                FOR UPDATE OF o
-                """
+                "SELECT id_estado, total FROM ordenes "
+                "WHERE id_orden = :o FOR UPDATE"
             ),
             {"o": id_orden},
         ).mappings().first()
         if orden is None:
             raise VentaError("La orden no existe.")
-        if bool(orden["es_final"]):
+
+        es_final = conn.execute(
+            text("SELECT es_final FROM estados_orden WHERE id_estado = :e"),
+            {"e": int(orden["id_estado"])},
+        ).scalar_one()
+        if bool(es_final):
             raise VentaError("La orden ya fue cobrada o cancelada.")
 
         total = dinero(orden["total"])

@@ -49,6 +49,8 @@ from services.ventas import (
     cobrar_orden_mesa,
     eliminar_partida,
     guardar_orden_mesa,
+    modificar_cantidad_partida,
+    porciones_disponibles,
 )
 
 
@@ -180,20 +182,57 @@ def _render_detalles(
             indice += 1
 
         if permitir_eliminar:
-            if columnas[indice].button(
-                "🗑️",
-                key=f"eliminar_detalle_{id_detalle}",
-                help="Eliminar producto de la cuenta",
+            if str(detalle["estado_detalle"]) == "Pendiente":
+                if columnas[indice].button(
+                    "🗑️",
+                    key=f"eliminar_detalle_{id_detalle}",
+                    help="Eliminar producto de la cuenta",
+                ):
+                    requerir_accion("ordenes.eliminar_partida")
+                    try:
+                        eliminar_partida(
+                            id_detalle=id_detalle,
+                            id_usuario=auth["id_usuario"],
+                            id_empleado=auth["id_empleado"],
+                        )
+                    except (StockInsuficienteError, VentaError, SQLAlchemyError) as exc:
+                        st.error(f"No se pudo eliminar el producto: {exc}")
+                    else:
+                        st.rerun()
+            else:
+                columnas[indice].caption("En preparación")
+
+        if (
+            permitir_eliminar
+            and str(detalle["estado_detalle"]) == "Pendiente"
+        ):
+            c_cantidad, c_actualizar = st.columns([2, 1])
+            nueva_cantidad = c_cantidad.number_input(
+                "Cantidad",
+                min_value=1,
+                value=int(detalle["cantidad"]),
+                step=1,
+                key=f"cantidad_detalle_{id_detalle}",
+            )
+            if c_actualizar.button(
+                "Actualizar",
+                key=f"actualizar_detalle_{id_detalle}",
+                help="Cambiar la cantidad de esta partida",
             ):
                 requerir_accion("ordenes.eliminar_partida")
                 try:
-                    eliminar_partida(
+                    modificar_cantidad_partida(
                         id_detalle=id_detalle,
+                        nueva_cantidad=int(nueva_cantidad),
                         id_usuario=auth["id_usuario"],
                         id_empleado=auth["id_empleado"],
                     )
-                except (StockInsuficienteError, VentaError, SQLAlchemyError) as exc:
-                    st.error(f"No se pudo eliminar el producto: {exc}")
+                except (
+                    StockInsuficienteError,
+                    VentaError,
+                    SQLAlchemyError,
+                ) as exc:
+                    st.error(f"No se pudo actualizar la cantidad: {exc}")
                 else:
                     st.rerun()
 
@@ -201,8 +240,31 @@ def _render_detalles(
 def _agregar_producto_orden(
     producto_sel: dict, cantidad: int, comentario: str
 ) -> None:
-    """Callback: agrega al carrito y limpia la nota para el siguiente producto."""
-    st.session_state.setdefault("carrito", []).append(
+    """Callback: valida existencias, agrega al carrito y limpia la nota."""
+    carrito = st.session_state.setdefault("carrito", [])
+    porciones = producto_sel.get("porciones")
+    if porciones is not None:
+        en_carrito = sum(
+            int(item["cantidad"])
+            for item in carrito
+            if int(item["id_producto"]) == int(producto_sel["id_producto"])
+        )
+        maximo = max(int(porciones) - en_carrito, 0)
+        if maximo <= 0:
+            st.session_state["carrito_error"] = (
+                f"{producto_sel['nombre']} está agotado: no quedan porciones "
+                "disponibles con el stock actual."
+            )
+            return
+        if int(cantidad) > maximo:
+            st.session_state["carrito_error"] = (
+                f"Solo puedes agregar {maximo} unidad(es) más de "
+                f"{producto_sel['nombre']} (ya hay {en_carrito} en el carrito)."
+            )
+            return
+
+    st.session_state.pop("carrito_error", None)
+    carrito.append(
         {
             "id_producto": int(producto_sel["id_producto"]),
             "nombre": producto_sel["nombre"],
@@ -224,9 +286,12 @@ def _render_constructor_orden(id_mesa: int):
     st.markdown(f"### Mesa seleccionada: {numero}")
     productos = run_query(
         """
-        SELECT p.id_producto, p.nombre, p.precio_actual, p.id_area_preparacion, c.nombre AS categoria
-        FROM productos p JOIN categorias_productos c ON c.id_categoria = p.id_categoria
-        WHERE p.activo = TRUE AND p.disponible = TRUE ORDER BY c.nombre, p.nombre
+        SELECT p.id_producto, p.nombre, p.precio_actual,
+               p.id_area_preparacion, c.nombre AS categoria
+        FROM productos p
+        JOIN categorias_productos c ON c.id_categoria = p.id_categoria
+        WHERE p.activo = TRUE AND p.disponible = TRUE
+        ORDER BY c.nombre, p.nombre
         """
     )
     if productos.empty:
@@ -234,19 +299,52 @@ def _render_constructor_orden(id_mesa: int):
         return
 
     carrito = st.session_state.setdefault("carrito", [])
+    porciones = porciones_disponibles(None)
+    registros = productos.to_dict("records")
+    for registro in registros:
+        registro["porciones"] = porciones.get(int(registro["id_producto"]))
 
-    categorias = productos["categoria"].unique().tolist()
+    categorias = sorted({registro["categoria"] for registro in registros})
     tab_cat = st.selectbox("Categoría", categorias)
-    subset = productos[productos["categoria"] == tab_cat]
+    subset = [
+        registro for registro in registros
+        if registro["categoria"] == tab_cat
+    ]
+
+    def _etiqueta_producto(producto: dict) -> str:
+        etiqueta = f"{producto['nombre']} (${producto['precio_actual']})"
+        disponibles = producto["porciones"]
+        if disponibles is None:
+            return etiqueta + " — Sin receta"
+        if int(disponibles) <= 0:
+            return etiqueta + " — Agotado"
+        return etiqueta + f" — {int(disponibles)} porción(es)"
 
     col1, col2 = st.columns([3, 1])
     with col1:
         producto_sel = st.selectbox(
-            "Producto", subset.to_dict("records"),
-            format_func=lambda p: f"{p['nombre']} (${p['precio_actual']})",
+            "Producto", subset, format_func=_etiqueta_producto,
         )
     with col2:
         cantidad = st.number_input("Cant.", min_value=1, value=1, step=1)
+
+    en_carrito = sum(
+        int(item["cantidad"])
+        for item in carrito
+        if int(item["id_producto"]) == int(producto_sel["id_producto"])
+    )
+    restantes = (
+        None
+        if producto_sel["porciones"] is None
+        else max(int(producto_sel["porciones"]) - en_carrito, 0)
+    )
+    if restantes is not None:
+        if restantes <= 0:
+            st.warning(
+                f"{producto_sel['nombre']} está agotado con el stock actual."
+            )
+        else:
+            st.caption(f"Máximo disponible para agregar: {restantes}.")
 
     comentario = st.text_input(
         "Comentarios/Notas de preparación (opcional)",
@@ -259,7 +357,11 @@ def _render_constructor_orden(id_mesa: int):
         "➕ Agregar producto",
         on_click=_agregar_producto_orden,
         args=(producto_sel, int(cantidad), comentario),
+        disabled=restantes == 0,
     )
+    error_carrito = st.session_state.pop("carrito_error", None)
+    if error_carrito:
+        st.warning(error_carrito)
 
     if carrito:
         st.markdown("#### Carrito")

@@ -61,6 +61,7 @@ ACCIONES: dict[str, tuple[str, ...]] = {
     "mermas.reportar": (ADMIN, GERENTE, MESERO, CAJA, COCINA, BAR),
     "mermas.gestionar": (ADMIN, GERENTE),
     "productos.gestionar": (ADMIN, GERENTE),
+    "recetas.gestionar": (ADMIN, GERENTE),
     "inventario.gestionar": (ADMIN, GERENTE),
     "compras.registrar": (ADMIN, GERENTE),
     "usuarios.gestionar": (ADMIN, GERENTE),

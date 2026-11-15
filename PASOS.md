@@ -237,7 +237,13 @@ docker compose exec -T db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
 docker compose down -v
 docker compose up -d --build
 docker compose exec app python set_admin_password.py
+docker compose exec app python crear_usuarios_prueba.py
 ```
+
+> Si vienes de una versión anterior, **recrea el volumen** para que se creen
+> las tablas `modificadores_producto` y `detalle_modificadores` y se carguen
+> los modificadores de ejemplo. `crear_usuarios_prueba.py` es idempotente y
+> deja las cuentas de prueba listas.
 
 ---
 
@@ -280,6 +286,7 @@ El puerto solo escucha en `127.0.0.1` (no queda expuesto a la red local).
 | `port is already allocated` (3307 u 8501) | Otro servicio usa el puerto. Cambia `MYSQL_EXPOSED_PORT` o `APP_PORT` en `.env`. |
 | La app dice “No hay conexión con la base de datos” | La BD aún inicializa; espera 30 s y recarga. Si persiste: `docker compose logs db`. |
 | Cambié `schema.sql`/`seed.sql` y no se refleja | Solo corren con el volumen vacío → `docker compose down -v` (borra datos). |
+| No aparece la pestaña **Modificadores** o falla una venta personalizada | El volumen es de una versión anterior sin las tablas nuevas → recrea con `docker compose down -v && docker compose up -d --build`. |
 | “Usuario o contraseña incorrectos” con `admin` | Falta el paso 6. |
 | “Tu usuario no está vinculado a una ficha de empleado” | Los movimientos de inventario exigen empleado. Crea el usuario en **Usuarios** vinculándolo a un empleado. |
 | “No se registró la venta: no alcanza el inventario” | Registra una **Compra** o un **Ajuste positivo** del insumo indicado. |

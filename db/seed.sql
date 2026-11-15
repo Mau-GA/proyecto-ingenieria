@@ -204,6 +204,17 @@ INSERT INTO recetas (id_producto, id_insumo, cantidad_usada) VALUES
 (9, 12, 0.10), (9, 14, 0.30),
 (10, 13, 0.03);
 
+-- Personalizaciones de ejemplo. Los dos 'Quitar' usan insumos que sí están
+-- en la receta de su producto (lechuga/tomate en la hamburguesa clásica).
+INSERT INTO modificadores_producto
+    (id_modificador, id_producto, tipo, nombre, id_insumo, id_insumo_nuevo,
+     cantidad, precio_extra, activo) VALUES
+(1, 1, 'Quitar',    'Sin lechuga',                       4, NULL, NULL,   0.00, TRUE),
+(2, 1, 'Quitar',    'Sin tomate',                        5, NULL, NULL,   0.00, TRUE),
+(3, 1, 'Extra',     'Extra queso',                       3, NULL, 0.030, 15.00, TRUE),
+(4, 2, 'Extra',     'Extra salsa BBQ',                   7, NULL, 0.020, 10.00, TRUE),
+(5, 2, 'Sustituir', 'Sustituir salsa BBQ por Buffalo',   7, 8,    0.030,  5.00, TRUE);
+
 -- ---------------------------------------------------------------------
 -- B.4 Compras y detalle de compra
 -- ---------------------------------------------------------------------
@@ -402,11 +413,13 @@ SELECT setval(pg_get_serial_sequence('proveedores', 'id_proveedor'), COALESCE(MA
 SELECT setval(pg_get_serial_sequence('insumos', 'id_insumo'), COALESCE(MAX(id_insumo), 1), MAX(id_insumo) IS NOT NULL) FROM insumos;
 SELECT setval(pg_get_serial_sequence('productos', 'id_producto'), COALESCE(MAX(id_producto), 1), MAX(id_producto) IS NOT NULL) FROM productos;
 SELECT setval(pg_get_serial_sequence('recetas', 'id_receta'), COALESCE(MAX(id_receta), 1), MAX(id_receta) IS NOT NULL) FROM recetas;
+SELECT setval(pg_get_serial_sequence('modificadores_producto', 'id_modificador'), COALESCE(MAX(id_modificador), 1), MAX(id_modificador) IS NOT NULL) FROM modificadores_producto;
 SELECT setval(pg_get_serial_sequence('compras', 'id_compra'), COALESCE(MAX(id_compra), 1), MAX(id_compra) IS NOT NULL) FROM compras;
 SELECT setval(pg_get_serial_sequence('detalle_compra', 'id_detalle_compra'), COALESCE(MAX(id_detalle_compra), 1), MAX(id_detalle_compra) IS NOT NULL) FROM detalle_compra;
 SELECT setval(pg_get_serial_sequence('mesas', 'id_mesa'), COALESCE(MAX(id_mesa), 1), MAX(id_mesa) IS NOT NULL) FROM mesas;
 SELECT setval(pg_get_serial_sequence('ordenes', 'id_orden'), COALESCE(MAX(id_orden), 1), MAX(id_orden) IS NOT NULL) FROM ordenes;
 SELECT setval(pg_get_serial_sequence('detalles_orden', 'id_detalle'), COALESCE(MAX(id_detalle), 1), MAX(id_detalle) IS NOT NULL) FROM detalles_orden;
+SELECT setval(pg_get_serial_sequence('detalle_modificadores', 'id_detalle_modificador'), COALESCE(MAX(id_detalle_modificador), 1), MAX(id_detalle_modificador) IS NOT NULL) FROM detalle_modificadores;
 SELECT setval(pg_get_serial_sequence('pagos', 'id_pago'), COALESCE(MAX(id_pago), 1), MAX(id_pago) IS NOT NULL) FROM pagos;
 SELECT setval(pg_get_serial_sequence('tickets', 'id_ticket'), COALESCE(MAX(id_ticket), 1), MAX(id_ticket) IS NOT NULL) FROM tickets;
 SELECT setval(pg_get_serial_sequence('movimientos_inventario', 'id_movimiento'), COALESCE(MAX(id_movimiento), 1), MAX(id_movimiento) IS NOT NULL) FROM movimientos_inventario;

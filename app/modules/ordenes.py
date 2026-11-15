@@ -43,6 +43,7 @@ from permissions import (
     GERENTE,
     MESERO,
 )
+from services.modificadores import modificadores_de_producto
 from services.ventas import (
     StockInsuficienteError,
     VentaError,
@@ -109,6 +110,24 @@ def _texto(valor) -> str:
     return "" if texto in ("None", "nan") else texto
 
 
+def _resumen_modificadores(modificadores) -> str:
+    """Etiqueta legible: SIN/EXTRA/CAMBIO con su costo extra."""
+    partes = []
+    for modificador in modificadores or []:
+        tipo = str(modificador["tipo"])
+        prefijo = {
+            "Quitar": "SIN",
+            "Extra": "EXTRA",
+            "Sustituir": "CAMBIO",
+        }.get(tipo, tipo.upper())
+        texto = f"{prefijo}: {modificador['nombre']}"
+        precio = float(modificador.get("precio_extra") or 0)
+        if precio > 0:
+            texto += f" +${precio:.2f}"
+        partes.append(texto)
+    return " · ".join(partes)
+
+
 def _pendientes_de_cobro(id_orden: int) -> int:
     """Cantidad de partidas no mermadas que aún no están listas/entregadas."""
     fila = run_query(
@@ -140,6 +159,22 @@ def _render_detalles(
         st.caption("La cuenta no tiene productos.")
         return
 
+    modificadores_df = run_query(
+        """
+        SELECT dm.id_detalle, dm.tipo, dm.nombre, dm.precio_extra
+        FROM detalle_modificadores dm
+        JOIN detalles_orden d ON d.id_detalle = dm.id_detalle
+        WHERE d.id_orden = :orden
+        ORDER BY dm.id_detalle_modificador
+        """,
+        {"orden": id_orden},
+    )
+    modificadores_por_detalle: dict[int, list[dict]] = {}
+    for _, fila_mod in modificadores_df.iterrows():
+        modificadores_por_detalle.setdefault(
+            int(fila_mod["id_detalle"]), []
+        ).append(fila_mod.to_dict())
+
     auth = usuario_actual()
     for _, detalle in detalles.iterrows():
         id_detalle = int(detalle["id_detalle"])
@@ -160,6 +195,12 @@ def _render_detalles(
         if comentario:
             columnas[1].caption(f"📝 {comentario}")
         columnas[2].markdown(f"~~{subtotal}~~" if mermado else subtotal)
+
+        resumen_mods = _resumen_modificadores(
+            modificadores_por_detalle.get(id_detalle, [])
+        )
+        if resumen_mods:
+            st.caption(f"🧾 {resumen_mods}")
 
         if mermado:
             st.markdown(
@@ -238,10 +279,17 @@ def _render_detalles(
 
 
 def _agregar_producto_orden(
-    producto_sel: dict, cantidad: int, comentario: str
+    producto_sel: dict,
+    cantidad: int,
+    comentario: str,
+    modificadores_sel: list[dict] | None = None,
 ) -> None:
     """Callback: valida existencias, agrega al carrito y limpia la nota."""
     carrito = st.session_state.setdefault("carrito", [])
+    modificadores_sel = list(modificadores_sel or [])
+    if modificadores_sel:
+        cantidad = 1
+
     porciones = producto_sel.get("porciones")
     if porciones is not None:
         en_carrito = sum(
@@ -264,14 +312,19 @@ def _agregar_producto_orden(
             return
 
     st.session_state.pop("carrito_error", None)
+    extras = sum(float(m.get("precio_extra") or 0) for m in modificadores_sel)
     carrito.append(
         {
             "id_producto": int(producto_sel["id_producto"]),
             "nombre": producto_sel["nombre"],
             "cantidad": int(cantidad),
-            "precio": float(producto_sel["precio_actual"]),
+            "precio": float(producto_sel["precio_actual"]) + extras,
             "id_area_preparacion": int(producto_sel["id_area_preparacion"]),
             "comentario": comentario.strip(),
+            "modificadores": [
+                int(m["id_modificador"]) for m in modificadores_sel
+            ],
+            "modificadores_detalle": modificadores_sel,
         }
     )
     st.session_state["orden_comentario"] = ""
@@ -325,8 +378,50 @@ def _render_constructor_orden(id_mesa: int):
         producto_sel = st.selectbox(
             "Producto", subset, format_func=_etiqueta_producto,
         )
+    modificadores_disponibles = modificadores_de_producto(
+        int(producto_sel["id_producto"])
+    )
+    modificadores_por_id = {
+        int(m["id_modificador"]): m for m in modificadores_disponibles
+    }
+    modificadores_sel: list[dict] = []
+    if modificadores_por_id:
+        ids_sel = st.multiselect(
+            "Personalizar",
+            list(modificadores_por_id),
+            format_func=lambda id_mod: (
+                f"{modificadores_por_id[id_mod]['nombre']} "
+                f"({modificadores_por_id[id_mod]['tipo']}"
+                + (
+                    f" +${float(modificadores_por_id[id_mod]['precio_extra']):.2f}"
+                    if float(modificadores_por_id[id_mod]["precio_extra"]) > 0
+                    else ""
+                )
+                + ")"
+            ),
+            key=f"modificadores_orden_{producto_sel['id_producto']}",
+        )
+        modificadores_sel = [modificadores_por_id[i] for i in ids_sel]
+    es_personalizada = bool(modificadores_sel)
     with col2:
-        cantidad = st.number_input("Cant.", min_value=1, value=1, step=1)
+        cantidad = st.number_input(
+            "Cant.",
+            min_value=1,
+            value=1,
+            step=1,
+            disabled=es_personalizada,
+            key=(
+                f"cantidad_orden_"
+                f"{'personalizada' if es_personalizada else 'base'}_"
+                f"{producto_sel['id_producto']}"
+            ),
+        )
+    if es_personalizada:
+        cantidad = 1
+        st.caption(
+            "Las partidas personalizadas se agregan de a una unidad. "
+            "Si necesitas más, agrega otra línea."
+        )
 
     en_carrito = sum(
         int(item["cantidad"])
@@ -353,10 +448,17 @@ def _render_constructor_orden(id_mesa: int):
         key="orden_comentario",
     )
 
+    extras = sum(
+        float(m.get("precio_extra") or 0) for m in modificadores_sel
+    )
+    precio_pieza = float(producto_sel["precio_actual"]) + extras
+    if modificadores_sel:
+        st.markdown(f"**Precio por pieza: ${precio_pieza:.2f}**")
+
     st.button(
         "➕ Agregar producto",
         on_click=_agregar_producto_orden,
-        args=(producto_sel, int(cantidad), comentario),
+        args=(producto_sel, int(cantidad), comentario, modificadores_sel),
         disabled=restantes == 0,
     )
     error_carrito = st.session_state.pop("carrito_error", None)
@@ -371,6 +473,11 @@ def _render_constructor_orden(id_mesa: int):
             total += subtotal
             c1, c2 = st.columns([5, 1])
             c1.write(f"{item['cantidad']} × {item['nombre']} — ${subtotal:.2f}")
+            resumen_mods = _resumen_modificadores(
+                item.get("modificadores_detalle") or []
+            )
+            if resumen_mods:
+                c1.caption(f"🧾 {resumen_mods}")
             if item.get("comentario"):
                 c1.caption(f"📝 {item['comentario']}")
             if c2.button("Quitar", key=f"quitar_{i}"):
@@ -384,7 +491,8 @@ def _render_constructor_orden(id_mesa: int):
             partidas = [
                 {"id_producto": it["id_producto"], "cantidad": it["cantidad"],
                  "precio_unitario": it["precio"], "id_area_preparacion": it["id_area_preparacion"],
-                 "comentario": it.get("comentario")}
+                 "comentario": it.get("comentario"),
+                 "modificadores": it.get("modificadores") or []}
                 for it in carrito
             ]
             try:

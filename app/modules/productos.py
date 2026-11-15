@@ -6,6 +6,7 @@ import streamlit as st
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from database import run_query, execute
+from modules.modificadores import render_modificadores
 from modules.recetas import render_recetas
 from permissions import requerir_rol, requerir_accion, ADMIN, GERENTE
 from services.catalogo import (
@@ -317,8 +318,14 @@ def render():
     requerir_rol(ADMIN, GERENTE)
     st.subheader("🍔 Productos")
 
-    tab_catalogo, tab_nuevo, tab_recetas, tab_categorias = st.tabs(
-        ["Catálogo", "Nuevo producto", "Recetas", "Categorías"]
+    (
+        tab_catalogo, tab_nuevo, tab_recetas, tab_modificadores,
+        tab_categorias,
+    ) = st.tabs(
+        [
+            "Catálogo", "Nuevo producto", "Recetas", "Modificadores",
+            "Categorías",
+        ]
     )
 
     with tab_catalogo:
@@ -329,6 +336,9 @@ def render():
 
     with tab_recetas:
         render_recetas()
+
+    with tab_modificadores:
+        render_modificadores()
 
     with tab_categorias:
         _render_categorias()

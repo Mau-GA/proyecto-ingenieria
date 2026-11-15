@@ -31,14 +31,17 @@ import re
 import time
 from decimal import Decimal
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Connection
 
 from database import transaccion
+from services.modificadores import foto_de_detalle, guardar_foto_modificadores
 from services.ventas import (
     StockInsuficienteError,
     VentaError,
+    calcular_consumo,
     descontar_inventario,
+    guardar_consumo_detalle,
     recalcular_total_orden,
 )
 
@@ -101,38 +104,58 @@ def _crear_mermas_de_receta(
     id_orden: int | None = None,
     id_detalle: int | None = None,
     reporte: str | None = None,
+    modificadores: list[dict] | None = None,
 ) -> list[int]:
-    """Crea una merma pendiente por cada insumo de la receta, sin tocar stock."""
-    receta = conn.execute(
-        text(
-            """
-            SELECT r.id_insumo, i.nombre AS insumo, r.cantidad_usada,
-                   i.costo_unitario_referencia
-            FROM recetas r
-            JOIN insumos i ON i.id_insumo = r.id_insumo
-            WHERE r.id_producto = :producto
-            ORDER BY r.id_insumo
-            """
-        ),
-        {"producto": int(id_producto)},
-    ).mappings().all()
-    if not receta:
+    """Crea una merma pendiente por cada insumo consumido, sin tocar stock.
+
+    Si la partida trae una foto de modificadores, el consumo se calcula con
+    ella (receta - resta + suma), igual que en la venta original.
+    """
+    consumo = calcular_consumo(
+        conn,
+        [
+            {
+                "id_producto": int(id_producto),
+                "cantidad": int(cantidad_unidades),
+                "id_detalle": id_detalle,
+                "modificadores": modificadores or [],
+            }
+        ],
+    )
+    if not consumo:
         raise MermaError(
             f"El producto «{producto}» no tiene receta registrada; "
             "no se puede descontar inventario. Agrega su receta primero."
         )
+
+    filas = conn.execute(
+        text(
+            """
+            SELECT i.id_insumo, i.nombre AS insumo,
+                   i.costo_unitario_referencia
+            FROM insumos i
+            WHERE i.id_insumo IN :ids
+            ORDER BY i.id_insumo
+            """
+        ).bindparams(bindparam("ids", expanding=True)),
+        {"ids": sorted(consumo)},
+    ).mappings().all()
+    por_id = {int(fila["id_insumo"]): fila for fila in filas}
 
     id_tipo_merma = _id_tipo_merma(conn, nombre_tipo_merma)
     reporte = reporte or f"{origen_tipo}-{time.time_ns()}"
     descripcion = _truncar(f"Producto: {producto} | Motivo: {motivo}", 255)
     ids_mermas: list[int] = []
 
-    for item in receta:
-        cantidad = (
-            Decimal(str(item["cantidad_usada"])) * Decimal(int(cantidad_unidades))
-        ).quantize(Decimal("0.001"))
+    for id_insumo in sorted(consumo):
+        cantidad = Decimal(str(consumo[id_insumo])).quantize(Decimal("0.001"))
         if cantidad <= 0:
             continue
+        item = por_id.get(int(id_insumo))
+        if item is None:
+            raise MermaError(
+                "Un insumo del consumo ya no existe en el catálogo."
+            )
 
         id_merma = conn.execute(
             text(
@@ -325,6 +348,7 @@ def registrar_merma_detalle(
         if ya_reportada:
             raise MermaError("Este producto ya fue reportado como merma.")
 
+        foto_modificadores = foto_de_detalle(conn, id_detalle)
         ids_mermas = _crear_mermas_de_receta(
             conn,
             id_producto=int(fila["id_producto"]),
@@ -338,6 +362,7 @@ def registrar_merma_detalle(
             id_orden=int(fila["id_orden"]),
             id_detalle=id_detalle,
             reporte=f"partida-{int(id_detalle)}-{time.time_ns()}",
+            modificadores=foto_modificadores,
         )
 
         conn.execute(
@@ -430,6 +455,8 @@ def _repetir_detalle_en(
     if not mermada:
         raise MermaError("La partida no está reportada como merma.")
 
+    foto_modificadores = foto_de_detalle(conn, int(id_detalle))
+
     ya_repetida = conn.execute(
         text(
             """
@@ -488,6 +515,20 @@ def _repetir_detalle_en(
         },
     ).scalar_one()
     id_nuevo = int(id_nuevo)
+    guardar_foto_modificadores(conn, id_nuevo, foto_modificadores)
+    if foto_modificadores:
+        consumo = calcular_consumo(
+            conn,
+            [
+                {
+                    "id_producto": int(fila["id_producto"]),
+                    "cantidad": int(fila["cantidad"]),
+                    "id_detalle": int(id_detalle),
+                    "modificadores": foto_modificadores,
+                }
+            ],
+        )
+        guardar_consumo_detalle(conn, id_detalle=id_nuevo, consumo=consumo)
 
     if comentario and (comentario["comentario"] or "").strip():
         conn.execute(
@@ -538,6 +579,8 @@ def _repetir_detalle_en(
                     {
                         "id_producto": int(fila["id_producto"]),
                         "cantidad": int(fila["cantidad"]),
+                        "id_detalle": id_nuevo,
+                        "modificadores": foto_modificadores,
                     }
                 ],
                 id_empleado=id_empleado,

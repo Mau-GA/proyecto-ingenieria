@@ -35,8 +35,15 @@ from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Connection
 
 from database import get_engine, transaccion
+from services.modificadores import (
+    ModificadorError,
+    foto_de_detalle,
+    guardar_foto_modificadores,
+    resolver_modificadores,
+)
 
 CERO = Decimal("0")
+TABLA_CONSUMO_DETALLE = "detalles_orden_consumo"
 
 
 # =====================================================================
@@ -125,6 +132,63 @@ def _guardar_comentario(
     )
 
 
+def guardar_consumo_detalle(
+    conn: Connection,
+    *,
+    id_detalle: int,
+    consumo: dict[int, Decimal],
+    id_usuario: int | None = None,
+) -> None:
+    """Guarda una foto del consumo exacto de una partida personalizada.
+
+    La foto vive en auditoria con una tabla_afectada propia. No sustituye a
+    ``detalle_modificadores``: sirve para que una receta editada después no
+    cambie la reversa de una venta ya hecha.
+    """
+    if not consumo:
+        return
+    conn.execute(
+        text(
+            """
+            INSERT INTO auditoria
+                (id_usuario, tabla_afectada, id_registro_afectado,
+                 accion, datos_nuevos)
+            VALUES (:usuario, :tabla, :detalle, 'INSERT', CAST(:datos AS jsonb))
+            """
+        ),
+        {
+            "usuario": id_usuario,
+            "tabla": TABLA_CONSUMO_DETALLE,
+            "detalle": int(id_detalle),
+            "datos": json.dumps(
+                {str(k): str(v) for k, v in consumo.items()},
+                ensure_ascii=False,
+            ),
+        },
+    )
+
+
+def _consumo_guardado(
+    conn: Connection, id_detalle: int
+) -> dict[int, Decimal] | None:
+    datos = conn.execute(
+        text(
+            """
+            SELECT datos_nuevos
+            FROM auditoria
+            WHERE tabla_afectada = :tabla
+              AND id_registro_afectado = :detalle
+            ORDER BY id_auditoria DESC
+            LIMIT 1
+            """
+        ),
+        {"tabla": TABLA_CONSUMO_DETALLE, "detalle": int(id_detalle)},
+    ).scalar()
+    if not datos:
+        return None
+    return {int(k): Decimal(str(v)) for k, v in datos.items()}
+
+
 def recalcular_total_orden(conn: Connection, id_orden: int) -> Decimal:
     """Recalcula y guarda el total de una orden.
 
@@ -186,32 +250,89 @@ def siguiente_numero_orden_diaria(conn: Connection) -> int:
 # =====================================================================
 # Inventario
 # =====================================================================
-def calcular_consumo(conn: Connection, partidas: list[dict]) -> dict[int, Decimal]:
-    """
-    Regresa {id_insumo: cantidad_total_a_descontar} para las partidas dadas.
-    partidas: [{"id_producto": int, "cantidad": int, ...}, ...]
-    """
-    cantidades: dict[int, int] = {}
-    for p in partidas:
-        pid = int(p["id_producto"])
-        cantidades[pid] = cantidades.get(pid, 0) + int(p["cantidad"])
-    if not cantidades:
+def _recetas_por_producto(
+    conn: Connection, ids_productos: set[int]
+) -> dict[int, dict[int, Decimal]]:
+    """Carga la receta vigente de varios productos en una sola consulta."""
+    if not ids_productos:
         return {}
-
     filas = conn.execute(
         text(
             "SELECT id_producto, id_insumo, cantidad_usada "
             "FROM recetas WHERE id_producto IN :ids"
         ).bindparams(bindparam("ids", expanding=True)),
-        {"ids": list(cantidades)},
+        {"ids": sorted(ids_productos)},
     ).all()
-
-    consumo: dict[int, Decimal] = {}
+    recetas: dict[int, dict[int, Decimal]] = {}
     for id_producto, id_insumo, cantidad_usada in filas:
-        consumo[int(id_insumo)] = (
-            consumo.get(int(id_insumo), CERO)
-            + Decimal(str(cantidad_usada)) * cantidades[int(id_producto)]
+        recetas.setdefault(int(id_producto), {})[int(id_insumo)] = Decimal(
+            str(cantidad_usada)
         )
+    return recetas
+
+
+def calcular_consumo(conn: Connection, partidas: list[dict]) -> dict[int, Decimal]:
+    """Regresa {id_insumo: cantidad_total_a_descontar} para las partidas.
+
+    Cada partida puede traer ``modificadores`` con la foto histórica. Si la
+    partida ya existe y solo se recibe ``id_detalle``, la foto se lee de
+    ``detalle_modificadores``. El consumo resultante es:
+    receta - cantidad_resta + cantidad_suma, multiplicado por la cantidad.
+    """
+    if not partidas:
+        return {}
+
+    ids_productos = {int(p["id_producto"]) for p in partidas}
+    recetas = _recetas_por_producto(conn, ids_productos)
+    consumo: dict[int, Decimal] = {}
+
+    for partida in partidas:
+        id_producto = int(partida["id_producto"])
+        cantidad = Decimal(int(partida["cantidad"]))
+        id_detalle = partida.get("id_detalle")
+        if id_detalle is not None:
+            guardado = _consumo_guardado(conn, int(id_detalle))
+            if guardado is not None:
+                for id_insumo, cantidad_guardada in guardado.items():
+                    consumo[id_insumo] = (
+                        consumo.get(id_insumo, CERO)
+                        + cantidad_guardada * cantidad
+                    )
+                continue
+
+        foto = partida.get("modificadores")
+        if foto is None and id_detalle is not None:
+            foto = foto_de_detalle(conn, int(id_detalle))
+
+        for id_insumo, cantidad_receta in recetas.get(id_producto, {}).items():
+            consumo[id_insumo] = (
+                consumo.get(id_insumo, CERO) + cantidad_receta * cantidad
+            )
+
+        for modificador in foto or []:
+            id_resta = modificador.get("id_insumo_resta")
+            if id_resta is not None:
+                id_resta = int(id_resta)
+                cantidad_resta = Decimal(str(modificador["cantidad_resta"]))
+                consumo[id_resta] = (
+                    consumo.get(id_resta, CERO) - cantidad_resta * cantidad
+                )
+
+            id_suma = modificador.get("id_insumo_suma")
+            if id_suma is not None:
+                id_suma = int(id_suma)
+                cantidad_suma = Decimal(str(modificador["cantidad_suma"]))
+                consumo[id_suma] = (
+                    consumo.get(id_suma, CERO) + cantidad_suma * cantidad
+                )
+
+    for id_insumo, cantidad in list(consumo.items()):
+        if cantidad < 0:
+            raise VentaError(
+                "Los modificadores dejan el consumo de un insumo en negativo."
+            )
+        if cantidad == 0:
+            del consumo[id_insumo]
     return consumo
 
 
@@ -369,11 +490,9 @@ def _revertir_inventario(
     completo; no se borra el movimiento de salida original. ``motivo`` permite
     distinguir una eliminación de una reducción de cantidad.
 
-    Limitación conocida: el consumo se calcula con la receta vigente, no con
-    una foto histórica. Si la receta cambió entre la venta y esta reversa, la
-    cantidad devuelta puede diferir de la descontada originalmente. Corregirlo
-    requeriría guardar la receta aplicada por partida (cambio de esquema), por
-    lo que en esta fase solo se documenta.
+    La partida debe traer la foto de ``detalle_modificadores`` cuando tenga
+    personalización. Si se omite, el consumo se calcula con la receta vigente
+    (comportamiento anterior para partidas sin modificadores).
     """
     consumo = calcular_consumo(conn, [partida])
     if not consumo:
@@ -432,6 +551,16 @@ def _expandir_partidas(partidas: list[dict]) -> list[dict]:
     return expandidas
 
 
+def _modificadores_de_entrada(partida: dict) -> tuple[list[int], list[dict]]:
+    """Separa ids de catálogo (entrada) de una foto ya resuelta (interna)."""
+    mods = partida.get("modificadores") or []
+    if not mods:
+        return [], []
+    if isinstance(mods[0], dict):
+        return [], list(mods)
+    return [int(valor) for valor in mods], []
+
+
 def agregar_partidas(
     conn: Connection,
     *,
@@ -445,11 +574,23 @@ def agregar_partidas(
     total de la orden. Todo dentro de `conn`.
 
     partidas: [{"id_producto", "cantidad", "precio_unitario",
-                "id_area_preparacion", "comentario"(opcional)}]
+                "id_area_preparacion", "comentario"(opcional),
+                "modificadores"(opcional, lista de ids)}]
     Regresa (total_actualizado_de_la_orden, resumen_inventario).
+
+    Una partida con modificadores siempre se guarda con cantidad 1 y su
+    precio unitario se calcula como precio_actual + suma de precio_extra.
     """
     if not partidas:
         raise VentaError("La orden no tiene productos.")
+
+    for partida in partidas:
+        ids, foto = _modificadores_de_entrada(partida)
+        if (ids or foto) and int(partida["cantidad"]) != 1:
+            raise VentaError(
+                "Una partida personalizada debe ser de cantidad 1; "
+                "agrega otra línea para más unidades."
+            )
 
     # Granularidad 1 a 1: cada unidad se guarda como una partida propia.
     partidas = _expandir_partidas(partidas)
@@ -457,7 +598,35 @@ def agregar_partidas(
     id_pendiente = _id_por_nombre(
         conn, "SELECT id_estado FROM estados_detalle_orden WHERE nombre = :n", "Pendiente"
     )
+    partidas_consumo: list[dict] = []
     for p in partidas:
+        ids, foto = _modificadores_de_entrada(p)
+        if ids:
+            try:
+                foto = resolver_modificadores(
+                    conn, int(p["id_producto"]), ids
+                )
+            except ModificadorError as exc:
+                raise VentaError(str(exc)) from exc
+
+        if foto:
+            precio_base = conn.execute(
+                text(
+                    "SELECT precio_actual FROM productos "
+                    "WHERE id_producto = :p"
+                ),
+                {"p": int(p["id_producto"])},
+            ).scalar_one_or_none()
+            if precio_base is None:
+                raise VentaError("El producto seleccionado no existe.")
+            extras = sum(
+                (Decimal(str(item["precio_extra"])) for item in foto),
+                CERO,
+            )
+            precio = dinero(Decimal(str(precio_base)) + extras)
+        else:
+            precio = dinero(p["precio_unitario"])
+
         resultado = conn.execute(
             text(
                 """
@@ -469,18 +638,45 @@ def agregar_partidas(
             ),
             {
                 "orden": id_orden, "producto": int(p["id_producto"]),
-                "cantidad": int(p["cantidad"]), "precio": dinero(p["precio_unitario"]),
+                "cantidad": int(p["cantidad"]), "precio": precio,
                 "area": int(p["id_area_preparacion"]), "estado": id_pendiente,
             },
         )
+        id_detalle = int(resultado.scalar_one())
+        guardar_foto_modificadores(conn, id_detalle, foto)
+        if foto:
+            consumo_partida = calcular_consumo(
+                conn,
+                [
+                    {
+                        "id_producto": int(p["id_producto"]),
+                        "cantidad": int(p["cantidad"]),
+                        "modificadores": foto,
+                    }
+                ],
+            )
+            guardar_consumo_detalle(
+                conn,
+                id_detalle=id_detalle,
+                consumo=consumo_partida,
+                id_usuario=id_usuario,
+            )
         _guardar_comentario(
             conn,
-            id_detalle=int(resultado.scalar_one()),
+            id_detalle=id_detalle,
             id_usuario=id_usuario,
             comentario=p.get("comentario"),
         )
+        partidas_consumo.append(
+            {**p, "modificadores": foto, "id_detalle": id_detalle}
+        )
 
-    resumen = descontar_inventario(conn, id_orden=id_orden, partidas=partidas, id_empleado=id_empleado)
+    resumen = descontar_inventario(
+        conn,
+        id_orden=id_orden,
+        partidas=partidas_consumo,
+        id_empleado=id_empleado,
+    )
 
     # El total lo calcula la BD desde la columna generada `subtotal`, pero
     # excluyendo las partidas ya reportadas como merma.
@@ -732,10 +928,16 @@ def eliminar_partida(
             )
 
         id_orden = int(fila["id_orden"])
+        foto = foto_de_detalle(conn, id_detalle)
         _revertir_inventario(
             conn,
             id_orden=id_orden,
-            partida={"id_producto": int(fila["id_producto"]), "cantidad": int(fila["cantidad"])},
+            partida={
+                "id_producto": int(fila["id_producto"]),
+                "cantidad": int(fila["cantidad"]),
+                "id_detalle": id_detalle,
+                "modificadores": foto,
+            },
             id_empleado=id_empleado,
         )
         conn.execute(
@@ -746,11 +948,13 @@ def eliminar_partida(
             text(
                 """
                 DELETE FROM auditoria
-                WHERE tabla_afectada = 'detalles_orden_comentario'
+                WHERE tabla_afectada IN (
+                    'detalles_orden_comentario', :tabla_consumo
+                )
                   AND id_registro_afectado = :detalle
                 """
             ),
-            {"detalle": id_detalle},
+            {"detalle": id_detalle, "tabla_consumo": TABLA_CONSUMO_DETALLE},
         )
 
         total = recalcular_total_orden(conn, id_orden)
@@ -815,6 +1019,19 @@ def modificar_cantidad_partida(
             raise VentaError(
                 "Este producto ya está en preparación; si se perdió, "
                 "repórtalo como merma."
+            )
+
+        personalizada = conn.execute(
+            text(
+                "SELECT 1 FROM detalle_modificadores "
+                "WHERE id_detalle = :detalle LIMIT 1"
+            ),
+            {"detalle": int(id_detalle)},
+        ).scalar()
+        if personalizada:
+            raise VentaError(
+                "Esta partida está personalizada; agrega otra partida "
+                "para cambiar la cantidad."
             )
 
         id_orden = int(fila["id_orden"])

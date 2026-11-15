@@ -68,6 +68,18 @@ def _comandas_por_estado():
         SELECT d.id_detalle, d.id_orden, d.id_producto, d.cantidad,
                p.nombre AS producto, a.nombre AS area, ed.nombre AS estado,
                m.numero_mesa, n.comentario, mm.merma_motivo,
+               (
+                   SELECT string_agg(
+                       CASE dm.tipo
+                           WHEN 'Quitar' THEN 'SIN: ' || dm.nombre
+                           WHEN 'Extra' THEN 'EXTRA: ' || dm.nombre
+                           ELSE 'CAMBIO: ' || dm.nombre
+                       END,
+                       ' · ' ORDER BY dm.id_detalle_modificador
+                   )
+                   FROM detalle_modificadores dm
+                   WHERE dm.id_detalle = d.id_detalle
+               ) AS modificadores,
                o.numero_orden_diaria AS numero_dia
         FROM detalles_orden d
         JOIN productos p ON p.id_producto = d.id_producto
@@ -190,6 +202,10 @@ def _render_tarjeta(fila, estado: str, solo_lectura: bool) -> None:
             else "Sin mesa"
         )
         c2.caption(f"Orden #{int(fila['numero_dia'])} · {mesa} · {fila['area']}")
+
+        modificadores = _texto(fila["modificadores"])
+        if modificadores:
+            st.markdown(f"🧾 **Modificadores:** {modificadores}")
 
         comentario = _texto(fila["comentario"])
         if comentario:

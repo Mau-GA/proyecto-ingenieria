@@ -11,6 +11,13 @@ restaurante en un sistema web funcional con Streamlit + PostgreSQL + Docker.
 
 ## 0. Cambios de esta versión
 
+- **Personalización de productos (Fase 3):** catálogo de modificadores por
+  producto (`Quitar`, `Extra`, `Sustituir`) con cargo adicional opcional.
+  Cada partida guarda una foto histórica en `detalle_modificadores`; el
+  consumo de inventario, las reversas, las mermas y la reposición usan esa
+  foto, no el catálogo vigente. Los modificadores se administran desde
+  **Productos → Modificadores** y se eligen al agregar una partida en
+  **Órdenes**; **Comandas** los muestra al área de preparación.
 - **Nuevo módulo 💳 Punto de venta** (`app/modules/pos.py`), pantalla inicial
   para Administrador, Gerente, Mesero y Caja: catálogo por categoría con
   búsqueda, carrito con +/−, tipos de orden (Local con mesa, Para llevar,
@@ -119,8 +126,8 @@ proyectorestaurante/
 ├── .dockerignore
 ├── .gitignore
 ├── db/
-│   ├── schema.sql              Schema normalizado (sin cambios)
-│   └── seed.sql                Datos de prueba (sin cambios)
+│   ├── schema.sql              Schema normalizado + tablas de modificadores
+│   └── seed.sql                Datos de prueba + modificadores de ejemplo
 └── app/
     ├── app.py                  Entrada: conexión + login + navegación
     ├── database.py             Engine SQLAlchemy + helpers + transaccion()
@@ -130,12 +137,16 @@ proyectorestaurante/
     ├── set_admin_password.py   Utilidad para fijar la clave de admin
     ├── .streamlit/config.toml  Tema oscuro nativo de Streamlit
     ├── services/
-    │   └── ventas.py           Venta, descuento de inventario, cobro (transaccional)
+    │   ├── ventas.py           Venta, inventario, cobro (transaccional)
+    │   ├── modificadores.py    Catálogo, validación y foto por partida
+    │   └── mermas.py           Mermas y reposición con la foto histórica
     ├── modules/
     │   ├── pos.py              Punto de venta (mostrador)
     │   ├── mesas.py            Mapa de mesas
-    │   ├── ordenes.py          Cuentas abiertas por mesa y cobro
-    │   ├── productos.py        Catálogo del menú
+    │   ├── ordenes.py          Cuentas abiertas, personalización y cobro
+    │   ├── comandas.py         KDS con modificadores y notas
+    │   ├── productos.py        Catálogo del menú + pestaña Modificadores
+    │   ├── modificadores.py    Alta/edición de modificadores por producto
     │   ├── inventario.py       Existencias y ajustes
     │   ├── compras.py          Alta de compras a proveedor
     │   ├── usuarios.py         Alta de usuarios y roles (admin)

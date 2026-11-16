@@ -56,6 +56,8 @@ ACCIONES: dict[str, tuple[str, ...]] = {
     "ordenes.crear": (ADMIN, GERENTE, MESERO),
     "ordenes.cobrar": (ADMIN, GERENTE, CAJA),
     "ordenes.eliminar_partida": (ADMIN, GERENTE, CAJA),
+    "ordenes.cancelar": (ADMIN, GERENTE),
+    "bitacora.ver": (ADMIN, GERENTE),
     "comandas.preparar": (ADMIN, GERENTE, COCINA, BAR),
     "comandas.limpiar": (GERENTE,),
     "kds.configurar": (ADMIN, GERENTE),

@@ -5,6 +5,7 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
+from auth import usuario_actual
 from database import run_query, execute
 from modules.modificadores import render_modificadores
 from modules.recetas import render_recetas
@@ -156,6 +157,7 @@ def _render_catalogo() -> None:
                 id_area_preparacion=int(area["id_area"]),
                 precio=precio,
                 disponible=disponible,
+                id_usuario=(usuario_actual() or {}).get("id_usuario"),
             )
         except (CatalogoError, SQLAlchemyError) as exc:
             st.error(f"No se pudo actualizar el producto: {exc}")

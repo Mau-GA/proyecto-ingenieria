@@ -19,13 +19,16 @@ Regla de cobro: solo se puede cobrar cuando todas las partidas no mermadas
 están en estado 'Listo' o 'Entregado'. La validación se repite en el backend
 para que no se pueda saltar desde la interfaz.
 
-Las notas de preparación por producto se guardan en la bitácora
-`auditoria` (JSON) porque el esquema no tiene una columna específica y no
-se debe modificar la base de datos.
+Las notas de preparación por producto se guardan en ``detalle_notas`` y la
+marca de merma en ``detalle_mermas``.
 
 El mesero/cajero también puede reportar la merma de una partida desde el
 detalle de una cuenta abierta. La partida queda tachada, deja de sumar al
 total y el reporte aparece en la bandeja del Gerente.
+
+Gerente/Administrador pueden cancelar una orden completa con autorización
+de otro usuario con rol Gerente o Administrador; la cancelación deja
+auditoría en ``bitacora`` y su detalle en ``cancelaciones``.
 """
 import html
 
@@ -36,6 +39,7 @@ from auth import usuario_actual
 from components.merma import render_boton_mermar
 from database import run_query
 from permissions import (
+    puede_accion,
     requerir_rol,
     requerir_accion,
     ADMIN,
@@ -43,6 +47,7 @@ from permissions import (
     GERENTE,
     MESERO,
 )
+from services.cancelaciones import CancelacionError, cancelar_orden
 from services.modificadores import modificadores_de_producto
 from services.ventas import (
     StockInsuficienteError,
@@ -76,25 +81,12 @@ def _detalles_orden(id_orden: int):
         """
         SELECT d.id_detalle, d.cantidad, p.nombre AS producto,
                d.precio_unitario, d.subtotal, ed.nombre AS estado_detalle,
-               (
-                   SELECT a.datos_nuevos ->> 'comentario'
-                   FROM auditoria a
-                   WHERE a.tabla_afectada = 'detalles_orden_comentario'
-                     AND a.id_registro_afectado = d.id_detalle
-                   ORDER BY a.id_auditoria DESC
-                   LIMIT 1
-               ) AS comentario,
-               (
-                   SELECT a.datos_nuevos ->> 'motivo'
-                   FROM auditoria a
-                   WHERE a.tabla_afectada = 'detalles_orden_merma'
-                     AND a.id_registro_afectado = d.id_detalle
-                   ORDER BY a.id_auditoria DESC
-                   LIMIT 1
-               ) AS merma_motivo
+               n.comentario, mm.motivo AS merma_motivo
         FROM detalles_orden d
         JOIN productos p ON p.id_producto = d.id_producto
         JOIN estados_detalle_orden ed ON ed.id_estado = d.id_estado
+        LEFT JOIN detalle_notas n ON n.id_detalle = d.id_detalle
+        LEFT JOIN detalle_mermas mm ON mm.id_detalle = d.id_detalle
         WHERE d.id_orden = :orden
         ORDER BY d.id_detalle
         """,
@@ -139,9 +131,8 @@ def _pendientes_de_cobro(id_orden: int) -> int:
           AND ed.nombre NOT IN ('Listo', 'Entregado')
           AND NOT EXISTS (
               SELECT 1
-              FROM auditoria a
-              WHERE a.tabla_afectada = 'detalles_orden_merma'
-                AND a.id_registro_afectado = d.id_detalle
+              FROM detalle_mermas mm
+              WHERE mm.id_detalle = d.id_detalle
           )
         """,
         {"orden": id_orden},
@@ -611,6 +602,90 @@ def _render_cobro(orden, id_mesa: int | None) -> None:
         st.rerun()
 
 
+def _render_cancelacion(orden) -> None:
+    """Formulario de cancelación con autorización de Gerente/Administrador."""
+    if not puede_accion("ordenes.cancelar"):
+        return
+
+    id_orden = int(orden["id_orden"])
+    numero_orden = int(orden["numero_dia"])
+    motivos = run_query(
+        """
+        SELECT id, nombre
+        FROM motivos_cancelacion
+        WHERE activo = TRUE
+        ORDER BY id
+        """
+    )
+    if motivos.empty:
+        st.caption("No hay motivos de cancelación activos.")
+        return
+
+    with st.expander("🚫 Cancelar orden completa"):
+        st.warning(
+            "Esta acción no se puede deshacer. Si la orden ya fue cobrada, "
+            "el sistema no permite cancelarla: requiere un reembolso."
+        )
+        registros = motivos.to_dict("records")
+        with st.form(key=f"cancelar_orden_{id_orden}"):
+            motivo = st.selectbox(
+                "Motivo",
+                registros,
+                format_func=lambda m: m["nombre"],
+                key=f"cancelar_motivo_{id_orden}",
+            )
+            comentario = st.text_area(
+                "Comentario (obligatorio si el motivo es «Otro»)",
+                max_chars=200,
+                key=f"cancelar_comentario_{id_orden}",
+            )
+            st.markdown("**Autorización**")
+            usuario_autoriza = st.text_input(
+                "Usuario autorizante",
+                key=f"cancelar_usuario_{id_orden}",
+            )
+            password_autoriza = st.text_input(
+                "Contraseña del autorizante",
+                type="password",
+                key=f"cancelar_password_{id_orden}",
+            )
+            confirmar = st.checkbox(
+                "Confirmo que deseo cancelar la orden completa",
+                key=f"cancelar_confirmar_{id_orden}",
+            )
+            enviado = st.form_submit_button("Cancelar orden", type="primary")
+
+        if not enviado:
+            return
+        requerir_accion("ordenes.cancelar")
+        if not confirmar:
+            st.error("Marca la confirmación para cancelar la orden.")
+            return
+        auth = usuario_actual() or {}
+        try:
+            resultado = cancelar_orden(
+                id_orden=id_orden,
+                id_motivo=int(motivo["id"]),
+                id_usuario_solicita=int(auth["id_usuario"]),
+                usuario_autoriza=usuario_autoriza,
+                password_autoriza=password_autoriza,
+                comentario=comentario,
+            )
+        except CancelacionError as exc:
+            st.error(str(exc))
+            return
+        except SQLAlchemyError as exc:
+            st.error(f"No se pudo cancelar la orden: {exc}")
+            return
+
+        st.session_state["cancelacion_ok"] = (
+            f"Orden #{resultado['numero_dia']} cancelada. "
+            f"Partidas devueltas: {len(resultado['devueltas'])}; "
+            f"mermadas: {len(resultado['mermadas'])}."
+        )
+        st.rerun()
+
+
 def _render_cuentas_abiertas(
     *,
     solo_mesas: bool,
@@ -690,6 +765,7 @@ def _render_cuentas_abiertas(
                         "Puedes reportar mermas. El cobro lo realiza Caja cuando "
                         "cocina y bar terminen la preparación."
                     )
+                _render_cancelacion(orden)
 
 
 def _render_tab_mesas(*, puede_crear: bool, puede_cobrar: bool) -> None:
@@ -720,6 +796,7 @@ def _render_tab_mesas(*, puede_crear: bool, puede_cobrar: bool) -> None:
                         "El cobro lo realiza Caja cuando cocina y bar terminen "
                         "la preparación."
                     )
+                _render_cancelacion(orden)
             return
 
     if puede_cobrar:
@@ -748,6 +825,9 @@ def render():
     puede_cobrar = es_admin or CAJA in roles
 
     st.subheader("🧾 Órdenes")
+    mensaje_ok = st.session_state.pop("cancelacion_ok", None)
+    if mensaje_ok:
+        st.success(mensaje_ok)
     tab_mesas, tab_delivery = st.tabs(["🍽️ Mesas", "🛵 Delivery"])
     with tab_mesas:
         _render_tab_mesas(puede_crear=puede_crear, puede_cobrar=puede_cobrar)

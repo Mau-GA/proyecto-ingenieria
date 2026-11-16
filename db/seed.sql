@@ -108,7 +108,15 @@ INSERT INTO tipos_merma (id_tipo_merma, nombre, requiere_reporte_autoridad, desc
 (2, 'Merma de cocina', FALSE, 'Error de preparación, corte o manejo en cocina/bar'),
 (3, 'Accidente', FALSE, 'Caída, derrame u otro accidente operativo'),
 (4, 'Robo', TRUE, 'Sustracción de insumos o producto'),
-(5, 'Otro', FALSE, 'Cualquier causa no cubierta por los tipos anteriores');
+(5, 'Otro', FALSE, 'Cualquier causa no cubierta por los tipos anteriores'),
+(6, 'Cancelación de orden', FALSE, 'Partida ya preparada o entregada al cancelar la orden completa');
+
+INSERT INTO motivos_cancelacion (id, nombre, activo) VALUES
+(1, 'Cliente se retiró', TRUE),
+(2, 'Error de captura', TRUE),
+(3, 'Producto no disponible', TRUE),
+(4, 'Demora excesiva', TRUE),
+(5, 'Otro', TRUE);
 
 INSERT INTO categorias_insumos (id_categoria, nombre, descripcion) VALUES
 (1, 'Carnes', 'Productos carnicos'),
@@ -385,10 +393,10 @@ UNION ALL
 SELECT id_movimiento, 1, 8, 1, 'Tomate caducado encontrado en refrigerador', 17.50, FALSE, TIMESTAMP '2026-05-26 20:00:00'
 FROM movimientos_inventario WHERE motivo = 'Tomate caducado';
 
--- No se sembraron `tickets` ni `auditoria`: el dump original no llevaba
--- historial de tickets impresos ni bitácora de auditoría, por lo que no hay
--- nada que migrar; ambas tablas quedan listas para que la aplicación las
--- alimente desde el primer día de operación.
+-- No se sembraron `tickets` ni `bitacora`: el dump original no llevaba
+-- historial de tickets impresos ni bitácora forense, por lo que no hay nada
+-- que migrar; ambas tablas quedan listas para que la aplicación las alimente
+-- desde el primer día de operación.
 
 -- ---------------------------------------------------------------------
 -- Ajuste de secuencias (PostgreSQL)
@@ -429,4 +437,4 @@ SELECT setval(pg_get_serial_sequence('pagos', 'id_pago'), COALESCE(MAX(id_pago),
 SELECT setval(pg_get_serial_sequence('tickets', 'id_ticket'), COALESCE(MAX(id_ticket), 1), MAX(id_ticket) IS NOT NULL) FROM tickets;
 SELECT setval(pg_get_serial_sequence('movimientos_inventario', 'id_movimiento'), COALESCE(MAX(id_movimiento), 1), MAX(id_movimiento) IS NOT NULL) FROM movimientos_inventario;
 SELECT setval(pg_get_serial_sequence('mermas', 'id_merma'), COALESCE(MAX(id_merma), 1), MAX(id_merma) IS NOT NULL) FROM mermas;
-SELECT setval(pg_get_serial_sequence('auditoria', 'id_auditoria'), COALESCE(MAX(id_auditoria), 1), MAX(id_auditoria) IS NOT NULL) FROM auditoria;
+SELECT setval(pg_get_serial_sequence('motivos_cancelacion', 'id'), COALESCE(MAX(id), 1), MAX(id) IS NOT NULL) FROM motivos_cancelacion;

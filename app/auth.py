@@ -12,8 +12,10 @@ módulo autorizado y quedaría en un estado inconsistente.
 """
 import bcrypt
 import streamlit as st
+from sqlalchemy import text
 
-from database import run_query, execute
+from database import run_query, transaccion
+from services.bitacora import registrar_evento
 
 # Claves de sesión que pertenecen a un usuario/módulo y deben limpiarse al
 # cambiar de sesión para no filtrar estado entre usuarios.
@@ -65,10 +67,40 @@ def _limpiar_estado_sesion() -> None:
             st.session_state.pop(clave, None)
 
 
-def login(nombre_usuario: str, password: str) -> bool:
+def _registrar_intento(
+    nombre_usuario: str,
+    id_usuario: int | None,
+    tipo_evento: str,
+    motivo: str | None = None,
+) -> None:
+    """Registra LOGIN/LOGIN_FALLIDO/LOGOUT sin tocar la sesión de Streamlit."""
+    with transaccion() as conn:
+        registrar_evento(
+            conn,
+            tipo_evento=tipo_evento,
+            entidad="autenticacion",
+            id_entidad=id_usuario,
+            id_usuario=id_usuario,
+            datos_nuevos={
+                "nombre_usuario": (nombre_usuario or "").strip(),
+                "motivo": motivo,
+            },
+        )
+
+
+def _validar_credenciales(nombre_usuario: str, password: str) -> dict | None:
+    """
+    Valida un usuario/contraseña y registra el intento en la bitácora.
+
+    No modifica `st.session_state`: la usa `login` y también la cancelación
+    autorizada, que necesita validar credenciales sin abrir una sesión nueva.
+    """
     nombre_usuario = (nombre_usuario or "").strip()
     if not nombre_usuario or not password:
-        return False
+        _registrar_intento(
+            nombre_usuario, None, "LOGIN_FALLIDO", "Credenciales incompletas"
+        )
+        return None
 
     df = run_query(
         """
@@ -78,43 +110,92 @@ def login(nombre_usuario: str, password: str) -> bool:
         """,
         {"u": nombre_usuario},
     )
-    if df.empty or not bool(df.iloc[0]["activo"]):
-        return False
+    if df.empty:
+        _registrar_intento(nombre_usuario, None, "LOGIN_FALLIDO", "Usuario inexistente")
+        return None
 
     usuario = df.iloc[0]
-    if not _verificar_password(password, usuario["password_hash"]):
-        return False
-
     id_usuario = int(usuario["id_usuario"])
+    if not bool(usuario["activo"]):
+        _registrar_intento(
+            nombre_usuario, id_usuario, "LOGIN_FALLIDO", "Usuario inactivo"
+        )
+        return None
+    if not _verificar_password(password, usuario["password_hash"]):
+        _registrar_intento(
+            nombre_usuario, id_usuario, "LOGIN_FALLIDO", "Contraseña incorrecta"
+        )
+        return None
+
     roles = _roles_activos(id_usuario)
     if not roles:
         # Sin roles no hay módulos autorizados: no se crea sesión.
-        return False
+        _registrar_intento(
+            nombre_usuario, id_usuario, "LOGIN_FALLIDO", "Usuario sin roles activos"
+        )
+        return None
 
     empleado_df = run_query(
         "SELECT id_empleado FROM usuarios WHERE id_usuario = :id", {"id": id_usuario}
     )
     id_empleado = empleado_df.iloc[0]["id_empleado"]
+    id_empleado = (
+        None
+        if id_empleado is None or id_empleado != id_empleado
+        else int(id_empleado)
+    )
 
-    _limpiar_estado_sesion()
-    st.session_state["auth"] = {
+    with transaccion() as conn:
+        conn.execute(
+            text("UPDATE usuarios SET ultimo_acceso = NOW() WHERE id_usuario = :id"),
+            {"id": id_usuario},
+        )
+        registrar_evento(
+            conn,
+            tipo_evento="LOGIN",
+            entidad="autenticacion",
+            id_entidad=id_usuario,
+            id_usuario=id_usuario,
+            datos_nuevos={
+                "nombre_usuario": str(usuario["nombre_usuario"]),
+                "roles": roles,
+            },
+        )
+
+    return {
         "id_usuario": id_usuario,
-        "nombre_usuario": usuario["nombre_usuario"],
+        "nombre_usuario": str(usuario["nombre_usuario"]),
         "roles": roles,
         # Puede ser None: hay usuarios administrativos sin ficha de empleado
         # (ver comentario en db/schema.sql sobre `usuarios.id_empleado`).
         # Los módulos que registran movimientos de inventario/compras
         # requieren un id_empleado válido y deben avisar si es None.
-        "id_empleado": None if id_empleado is None or id_empleado != id_empleado else int(id_empleado),
+        "id_empleado": id_empleado,
     }
-    execute(
-        "UPDATE usuarios SET ultimo_acceso = NOW() WHERE id_usuario = :id",
-        {"id": id_usuario},
-    )
+
+
+def login(nombre_usuario: str, password: str) -> bool:
+    sesion = _validar_credenciales(nombre_usuario, password)
+    if sesion is None:
+        return False
+
+    _limpiar_estado_sesion()
+    st.session_state["auth"] = sesion
     return True
 
 
 def logout() -> None:
+    auth = usuario_actual()
+    if auth:
+        try:
+            _registrar_intento(
+                str(auth.get("nombre_usuario") or ""),
+                int(auth["id_usuario"]),
+                "LOGOUT",
+            )
+        except Exception:
+            # El cierre de sesión no debe fallar si la bitácora no responde.
+            pass
     st.session_state.pop("auth", None)
     _limpiar_estado_sesion()
 

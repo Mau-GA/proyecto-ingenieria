@@ -35,6 +35,7 @@ from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Connection
 
 from database import get_engine, transaccion
+from services.bitacora import registrar_evento
 from services.cocina import registrar_historial_pendiente
 from services.modificadores import (
     ModificadorError,
@@ -44,7 +45,6 @@ from services.modificadores import (
 )
 
 CERO = Decimal("0")
-TABLA_CONSUMO_DETALLE = "detalles_orden_consumo"
 
 
 # =====================================================================
@@ -105,12 +105,10 @@ def _guardar_comentario(
     id_usuario: int | None,
     comentario: str | None,
 ) -> None:
-    """Guarda la nota de preparación de una partida.
+    """Guarda la nota de preparación vigente de una partida.
 
-    El esquema no tiene una columna específica para comentarios y no se debe
-    modificar la base de datos, así que se usa la bitácora `auditoria` como
-    almacén JSON asociado al id del detalle. Esa misma nota se recupera en
-    Órdenes y en Comandas con una subconsulta al último registro.
+    Una sola nota por partida: si se vuelve a capturar, se actualiza la misma
+    fila de ``detalle_notas``. Órdenes y Comandas la leen con un LEFT JOIN.
     """
     texto = (comentario or "").strip()
     if not texto:
@@ -119,16 +117,18 @@ def _guardar_comentario(
     conn.execute(
         text(
             """
-            INSERT INTO auditoria
-                (id_usuario, tabla_afectada, id_registro_afectado, accion, datos_nuevos)
-            VALUES
-                (:usuario, 'detalles_orden_comentario', :detalle, 'INSERT', CAST(:datos AS jsonb))
+            INSERT INTO detalle_notas (id_detalle, comentario, id_usuario)
+            VALUES (:detalle, :comentario, :usuario)
+            ON CONFLICT (id_detalle) DO UPDATE
+            SET comentario = EXCLUDED.comentario,
+                id_usuario = EXCLUDED.id_usuario,
+                fecha = CURRENT_TIMESTAMP
             """
         ),
         {
             "usuario": id_usuario,
             "detalle": id_detalle,
-            "datos": json.dumps({"comentario": texto}, ensure_ascii=False),
+            "comentario": texto,
         },
     )
 
@@ -142,7 +142,7 @@ def guardar_consumo_detalle(
 ) -> None:
     """Guarda una foto del consumo exacto de una partida personalizada.
 
-    La foto vive en auditoria con una tabla_afectada propia. No sustituye a
+    La foto vive en ``detalle_consumo``. No sustituye a
     ``detalle_modificadores``: sirve para que una receta editada después no
     cambie la reversa de una venta ya hecha.
     """
@@ -151,15 +151,16 @@ def guardar_consumo_detalle(
     conn.execute(
         text(
             """
-            INSERT INTO auditoria
-                (id_usuario, tabla_afectada, id_registro_afectado,
-                 accion, datos_nuevos)
-            VALUES (:usuario, :tabla, :detalle, 'INSERT', CAST(:datos AS jsonb))
+            INSERT INTO detalle_consumo (id_detalle, consumo, id_usuario)
+            VALUES (:detalle, CAST(:datos AS jsonb), :usuario)
+            ON CONFLICT (id_detalle) DO UPDATE
+            SET consumo = EXCLUDED.consumo,
+                id_usuario = EXCLUDED.id_usuario,
+                fecha = CURRENT_TIMESTAMP
             """
         ),
         {
             "usuario": id_usuario,
-            "tabla": TABLA_CONSUMO_DETALLE,
             "detalle": int(id_detalle),
             "datos": json.dumps(
                 {str(k): str(v) for k, v in consumo.items()},
@@ -173,17 +174,8 @@ def _consumo_guardado(
     conn: Connection, id_detalle: int
 ) -> dict[int, Decimal] | None:
     datos = conn.execute(
-        text(
-            """
-            SELECT datos_nuevos
-            FROM auditoria
-            WHERE tabla_afectada = :tabla
-              AND id_registro_afectado = :detalle
-            ORDER BY id_auditoria DESC
-            LIMIT 1
-            """
-        ),
-        {"tabla": TABLA_CONSUMO_DETALLE, "detalle": int(id_detalle)},
+        text("SELECT consumo FROM detalle_consumo WHERE id_detalle = :detalle"),
+        {"detalle": int(id_detalle)},
     ).scalar()
     if not datos:
         return None
@@ -194,9 +186,8 @@ def recalcular_total_orden(conn: Connection, id_orden: int) -> Decimal:
     """Recalcula y guarda el total de una orden.
 
     Las partidas reportadas como merma se excluyen del cobro: su marca vive
-    en la bitácora `auditoria` (tabla_afectada = 'detalles_orden_merma').
-    Así, un producto mermado no se sigue cobrando aunque permanezca visible
-    en la cuenta para que el personal sepa qué pasó.
+    en ``detalle_mermas``. Así, un producto mermado no se sigue cobrando
+    aunque permanezca visible en la cuenta para que el personal sepa qué pasó.
     """
     total = dinero(
         conn.execute(
@@ -207,9 +198,8 @@ def recalcular_total_orden(conn: Connection, id_orden: int) -> Decimal:
                 WHERE d.id_orden = :o
                   AND NOT EXISTS (
                       SELECT 1
-                      FROM auditoria a
-                      WHERE a.tabla_afectada = 'detalles_orden_merma'
-                        AND a.id_registro_afectado = d.id_detalle
+                      FROM detalle_mermas m
+                      WHERE m.id_detalle = d.id_detalle
                   )
                 """
             ),
@@ -745,16 +735,32 @@ def registrar_venta(
         if total <= 0:
             raise VentaError("El total de la venta debe ser mayor a cero.")
 
-        conn.execute(
+        id_pago = conn.execute(
             text(
                 """
                 INSERT INTO pagos (id_orden, id_metodo_pago, monto, referencia_pago, id_usuario_registro)
                 VALUES (:orden, :metodo, :monto, :ref, :usuario)
+                RETURNING id_pago
                 """
             ),
             {
                 "orden": id_orden, "metodo": id_metodo_pago, "monto": total,
                 "ref": referencia_pago or None, "usuario": id_usuario,
+            },
+        ).scalar_one()
+
+        registrar_evento(
+            conn,
+            tipo_evento="PAGO",
+            entidad="pagos",
+            id_entidad=int(id_pago),
+            id_usuario=id_usuario,
+            datos_nuevos={
+                "id_orden": id_orden,
+                "numero_orden_diaria": numero_dia,
+                "monto": total,
+                "id_metodo_pago": id_metodo_pago,
+                "referencia_pago": referencia_pago,
             },
         )
 
@@ -955,6 +961,7 @@ def eliminar_partida(
             text(
                 """
                 SELECT d.id_orden, d.id_producto, d.cantidad, o.id_mesa,
+                       o.numero_orden_diaria,
                        ed.nombre AS estado_detalle
                 FROM detalles_orden d
                 JOIN ordenes o ON o.id_orden = d.id_orden
@@ -992,16 +999,12 @@ def eliminar_partida(
             {"detalle": id_detalle},
         )
         conn.execute(
-            text(
-                """
-                DELETE FROM auditoria
-                WHERE tabla_afectada IN (
-                    'detalles_orden_comentario', :tabla_consumo
-                )
-                  AND id_registro_afectado = :detalle
-                """
-            ),
-            {"detalle": id_detalle, "tabla_consumo": TABLA_CONSUMO_DETALLE},
+            text("DELETE FROM detalle_notas WHERE id_detalle = :detalle"),
+            {"detalle": id_detalle},
+        )
+        conn.execute(
+            text("DELETE FROM detalle_consumo WHERE id_detalle = :detalle"),
+            {"detalle": id_detalle},
         )
 
         total = recalcular_total_orden(conn, id_orden)
@@ -1020,6 +1023,19 @@ def eliminar_partida(
                     text("UPDATE mesas SET estado = 'Disponible' WHERE id_mesa = :m"),
                     {"m": int(fila["id_mesa"])},
                 )
+            registrar_evento(
+                conn,
+                tipo_evento="CANCELACION",
+                entidad="ordenes",
+                id_entidad=id_orden,
+                id_usuario=id_usuario,
+                datos_nuevos={
+                    "id_orden": id_orden,
+                    "numero_orden_diaria": int(fila["numero_orden_diaria"]),
+                    "motivo": "Sin partidas activas tras eliminar producto",
+                    "automatica": True,
+                },
+            )
 
     return total
 
@@ -1184,7 +1200,7 @@ def cobrar_orden_mesa(*, id_orden: int, id_mesa: int | None, id_metodo_pago: int
     with transaccion() as conn:
         orden = conn.execute(
             text(
-                "SELECT id_estado, total FROM ordenes "
+                "SELECT id_estado, total, numero_orden_diaria FROM ordenes "
                 "WHERE id_orden = :o FOR UPDATE"
             ),
             {"o": id_orden},
@@ -1213,9 +1229,8 @@ def cobrar_orden_mesa(*, id_orden: int, id_mesa: int | None, id_metodo_pago: int
                       AND ed.nombre NOT IN ('Listo', 'Entregado')
                       AND NOT EXISTS (
                           SELECT 1
-                          FROM auditoria a
-                          WHERE a.tabla_afectada = 'detalles_orden_merma'
-                            AND a.id_registro_afectado = d.id_detalle
+                          FROM detalle_mermas m
+                          WHERE m.id_detalle = d.id_detalle
                       )
                     """
                 ),
@@ -1230,18 +1245,34 @@ def cobrar_orden_mesa(*, id_orden: int, id_mesa: int | None, id_metodo_pago: int
         id_pagada = _id_por_nombre(
             conn, "SELECT id_estado FROM estados_orden WHERE nombre = :n", "Pagada"
         )
-        conn.execute(
+        id_pago = conn.execute(
             text(
                 """
                 INSERT INTO pagos (id_orden, id_metodo_pago, monto, referencia_pago, id_usuario_registro)
                 VALUES (:o, :m, :monto, :ref, :u)
+                RETURNING id_pago
                 """
             ),
             {"o": id_orden, "m": id_metodo_pago, "monto": total,
              "ref": referencia_pago or None, "u": id_usuario},
-        )
+        ).scalar_one()
         conn.execute(text("UPDATE ordenes SET id_estado = :e WHERE id_orden = :o"),
                      {"e": id_pagada, "o": id_orden})
+        registrar_evento(
+            conn,
+            tipo_evento="PAGO",
+            entidad="pagos",
+            id_entidad=int(id_pago),
+            id_usuario=id_usuario,
+            datos_nuevos={
+                "id_orden": id_orden,
+                "numero_orden_diaria": int(orden["numero_orden_diaria"]),
+                "monto": total,
+                "id_metodo_pago": id_metodo_pago,
+                "id_mesa": id_mesa,
+                "referencia_pago": referencia_pago,
+            },
+        )
         if id_mesa is not None:
             # La mesa solo se libera cuando ya no tiene otras cuentas abiertas.
             conn.execute(

@@ -157,9 +157,8 @@ def cambiar_estado_partida(
                        eo.nombre AS estado_orden, eo.es_final,
                        EXISTS (
                            SELECT 1
-                           FROM auditoria a
-                           WHERE a.tabla_afectada = 'detalles_orden_merma'
-                             AND a.id_registro_afectado = d.id_detalle
+                           FROM detalle_mermas m
+                           WHERE m.id_detalle = d.id_detalle
                        ) AS mermada
                 FROM detalles_orden d
                 JOIN estados_detalle_orden ed ON ed.id_estado = d.id_estado
@@ -211,9 +210,8 @@ def cambiar_estado_partida(
                   AND id_estado = :esperado
                   AND NOT EXISTS (
                       SELECT 1
-                      FROM auditoria a
-                      WHERE a.tabla_afectada = 'detalles_orden_merma'
-                        AND a.id_registro_afectado = detalles_orden.id_detalle
+                      FROM detalle_mermas m
+                      WHERE m.id_detalle = detalles_orden.id_detalle
                   )
                 """
             ),

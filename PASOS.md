@@ -245,18 +245,21 @@ docker compose exec app python crear_usuarios_prueba.py
 > los modificadores de ejemplo. `crear_usuarios_prueba.py` es idempotente y
 > deja las cuentas de prueba listas.
 >
-> **Fase 4 (KDS):** el cambio de esquema agrega `historial_estado_detalle` y
-> `configuracion_kds`, además de la fila de umbrales en `seed.sql`. Los
-> scripts de `db/` solo corren con el volumen vacío, así que después de
-> actualizar el código ejecuta:
+> **Fase 5 (bitácora y cancelación):** el cambio de esquema elimina
+> `auditoria` y agrega `detalle_notas`, `detalle_consumo`, `detalle_mermas`,
+> `detalle_reposiciones`, `mermas_pendientes`, `bitacora`,
+> `motivos_cancelacion` y `cancelaciones`. Los scripts de `db/` solo corren
+> con el volumen vacío, así que después de actualizar el código ejecuta:
 >
 > ```bash
 > docker compose down -v && docker compose up -d --build
+> docker compose exec app python set_admin_password.py
 > docker compose exec app python crear_usuarios_prueba.py
 > ```
 >
-> `down -v` **borra los datos** existentes. Vuelve a fijar la contraseña de
-> `admin` con `set_admin_password.py` si la usas para entrar.
+> `down -v` **borra los datos** existentes. La bitácora es inalterable por
+> triggers y tiene retención mínima de 1 año; no se debe purgar. Su cadena de
+> hashes se verifica desde **Reportes → Bitácora**.
 
 ---
 

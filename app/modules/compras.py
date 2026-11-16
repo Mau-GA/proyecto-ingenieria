@@ -1,8 +1,6 @@
 """Módulo de Compras: entrada de producto por secciones y actualización de stock."""
 from __future__ import annotations
 
-import json
-
 import pandas as pd
 import streamlit as st
 from sqlalchemy import text
@@ -11,6 +9,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from auth import usuario_actual
 from database import run_query, transaccion
 from permissions import requerir_accion, requerir_rol, ADMIN, GERENTE
+from services.bitacora import registrar_evento
 
 K_CARRITO = "carrito_compra"
 K_PROVEEDOR = "compras_proveedor"
@@ -222,7 +221,7 @@ def _render_seccion(insumos: pd.DataFrame) -> None:
 def _registrar_compra(
     proveedor: dict, carrito: list[dict], descuento: float, auth: dict
 ) -> int:
-    """Registra compra, detalles, movimientos, stock y auditoría en una transacción."""
+    """Registra compra, detalles, movimientos, stock y bitácora en una transacción."""
     subtotal = round(
         sum(
             float(item["cantidad"]) * float(item["costo_unitario"])
@@ -235,7 +234,7 @@ def _registrar_compra(
         raise ValueError("El descuento no puede ser mayor al subtotal.")
     total = round(subtotal - descuento, 2)
 
-    partidas_auditoria: list[dict] = []
+    partidas_compra: list[dict] = []
     for item in carrito:
         cantidad = float(item["cantidad"])
         costo = float(item["costo_unitario"])
@@ -243,7 +242,7 @@ def _registrar_compra(
             raise ValueError("Todas las cantidades deben ser mayores a cero.")
         if costo < 0:
             raise ValueError("Los precios unitarios no pueden ser negativos.")
-        partidas_auditoria.append(
+        partidas_compra.append(
             {
                 "id_insumo": int(item["id_insumo"]),
                 "nombre": str(item["nombre"]),
@@ -254,14 +253,14 @@ def _registrar_compra(
             }
         )
 
-    datos_auditoria = {
+    datos_compra = {
         "id_proveedor": int(proveedor["id_proveedor"]),
         "proveedor": str(proveedor["nombre"]),
         "id_empleado": int(auth["id_empleado"]),
         "subtotal": subtotal,
         "descuento": descuento,
         "total": total,
-        "partidas": partidas_auditoria,
+        "partidas": partidas_compra,
     }
 
     with transaccion() as conn:
@@ -332,21 +331,13 @@ def _registrar_compra(
                 },
             )
 
-        conn.execute(
-            text(
-                """
-                INSERT INTO auditoria
-                    (id_usuario, tabla_afectada, id_registro_afectado, accion,
-                     datos_nuevos)
-                VALUES (:usuario, 'compras', :registro, 'INSERT',
-                        CAST(:datos AS JSONB))
-                """
-            ),
-            {
-                "usuario": int(auth["id_usuario"]),
-                "registro": int(id_compra),
-                "datos": json.dumps(datos_auditoria, ensure_ascii=False),
-            },
+        registrar_evento(
+            conn,
+            tipo_evento="COMPRA",
+            entidad="compras",
+            id_entidad=int(id_compra),
+            id_usuario=int(auth["id_usuario"]),
+            datos_nuevos={**datos_compra, "id_compra": int(id_compra)},
         )
 
     return int(id_compra)

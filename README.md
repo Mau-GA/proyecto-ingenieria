@@ -11,6 +11,17 @@ restaurante en un sistema web funcional con Streamlit + PostgreSQL + Docker.
 
 ## 0. Cambios de esta versión
 
+- **Bitácora y cancelación autorizada (Fase 5):** se eliminó la tabla
+  `auditoria`; los comentarios, consumos, mermas, reposiciones y reportes
+  pendientes ahora viven en tablas propias (`detalle_notas`,
+  `detalle_consumo`, `detalle_mermas`, `detalle_reposiciones` y
+  `mermas_pendientes`). La nueva tabla `bitacora` es de solo lectura por
+  triggers, encadena cada evento con SHA-256 y se puede verificar desde
+  **Reportes → Bitácora** (`bitacora.ver`, Gerente/Administrador). En
+  **Órdenes** se agregó “Cancelar orden” (`ordenes.cancelar`, solo
+  Gerente/Administrador): exige motivo y contraseña de autorización, merma
+  las partidas ya preparadas sin volver a descontar stock y revierte el
+  consumo exacto de las partidas pendientes.
 - **KDS / Comandas (Fase 4):** historial de estados por partida
   (`historial_estado_detalle`), cambio de estado con secuencia validada y
   control de concurrencia, colores por tiempo de espera configurables
@@ -46,8 +57,10 @@ restaurante en un sistema web funcional con Streamlit + PostgreSQL + Docker.
   16 con UTF8/citext, puerto de BD solo en `127.0.0.1`, validación de
   variables obligatorias del `.env`.
 
-> **Si vienes de una versión anterior (Fases 1–3), recrea el volumen** para
-> que se creen las tablas `historial_estado_detalle` y `configuracion_kds`:
+> **Si vienes de una versión anterior (Fases 1–4), recrea el volumen** para
+> que se creen las tablas de la Fase 5 (`bitacora`, `cancelaciones`,
+> `motivos_cancelacion`, tablas `detalle_*` y `mermas_pendientes`) y se
+> elimine `auditoria`:
 >
 > ```bash
 > docker compose down -v && docker compose up -d --build
@@ -76,10 +89,11 @@ Los archivos **ya son un rediseño normalizado a 3FN** de un dump original
   acceso, y una cuenta administrativa puede no tener ficha laboral. Lo
   respeta el código (ver sección 10).
 - **Mermas en dos fases:** al reportar se crea la fila en `mermas` con
-  `id_movimiento = NULL` y una marca JSON en `auditoria`; el stock no cambia.
-  Al subirla, una partida ya vendida solo registra el costo (la venta ya
-  descontó receta) y una captura manual crea el movimiento `Merma` y descuenta
-  stock en ese momento.
+  `id_movimiento = NULL` y su detalle en `mermas_pendientes`; el stock no
+  cambia. Al subirla, una partida ya vendida solo registra el costo (la venta
+  ya descontó receta) y una captura manual crea el movimiento `Merma` y
+  descuenta stock en ese momento. La bandeja muestra únicamente las mermas
+  pendientes; al subirlas o rechazarlas se retiran de ella.
 - **Seed consistente:** las órdenes históricas quedan `Pagada` o `Cancelada`,
   sus partidas `Entregado`, los totales coinciden con la suma de partidas y
   pagos, y todas las mesas inician `Disponible`. La orden 18, sin partidas,

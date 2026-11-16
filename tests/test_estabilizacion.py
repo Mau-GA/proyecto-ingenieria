@@ -254,8 +254,8 @@ def test_merma_de_partida_vendida_no_descuenta_stock_dos_veces():
         {"ids": ids},
     ) == 0
     assert _escalar(
-        "SELECT COUNT(*) FROM auditoria WHERE tabla_afectada = 'mermas_pendientes' "
-        "AND id_registro_afectado = ANY(CAST(:ids AS integer[]))",
+        "SELECT COUNT(*) FROM mermas_pendientes "
+        "WHERE id_merma = ANY(CAST(:ids AS integer[]))",
         {"ids": ids},
     ) == len(ids)
 
@@ -302,8 +302,7 @@ def test_rechazar_merma_pendiente_restaura_total():
         {"ids": ids},
     ) == 0
     assert _escalar(
-        "SELECT COUNT(*) FROM auditoria WHERE tabla_afectada = "
-        "'detalles_orden_merma' AND id_registro_afectado = :d",
+        "SELECT COUNT(*) FROM detalle_mermas WHERE id_detalle = :d",
         {"d": id_detalle},
     ) == 0
 
@@ -405,8 +404,7 @@ def test_mermar_y_repetir_descuenta_receta_en_una_transaccion():
         {"o": id_orden},
     ) == detalles_antes + 1
     assert _escalar(
-        "SELECT COUNT(*) FROM auditoria WHERE tabla_afectada = "
-        "'detalles_orden_reposicion' AND id_registro_afectado = :d",
+        "SELECT COUNT(*) FROM detalle_reposiciones WHERE id_detalle = :d",
         {"d": id_detalle},
     ) == 1
     assert _escalar(
@@ -497,13 +495,11 @@ def test_mermar_y_repetir_sin_stock_no_deja_nada():
     ) == detalles_antes
     assert _escalar("SELECT COUNT(*) FROM mermas") == mermas_antes
     assert _escalar(
-        "SELECT COUNT(*) FROM auditoria WHERE tabla_afectada = "
-        "'mermas_pendientes' AND (datos_nuevos->>'id_detalle')::int = :d",
+        "SELECT COUNT(*) FROM mermas_pendientes WHERE id_detalle = :d",
         {"d": id_detalle},
     ) == 0
     assert _escalar(
-        "SELECT COUNT(*) FROM auditoria WHERE tabla_afectada = "
-        "'detalles_orden_reposicion' AND id_registro_afectado = :d",
+        "SELECT COUNT(*) FROM detalle_reposiciones WHERE id_detalle = :d",
         {"d": id_detalle},
     ) == 0
 

@@ -6,8 +6,10 @@ import streamlit as st
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
+from auth import usuario_actual
 from database import run_query, execute, transaccion
 from permissions import requerir_rol, requerir_accion, ADMIN, GERENTE
+from services.bitacora import registrar_evento
 
 
 def _hash_password(password_plano: str) -> str:
@@ -21,6 +23,7 @@ def _crear_usuario_con_roles(
     correo: str | None,
     password_hash: str,
     ids_roles: list[int],
+    id_usuario_actor: int | None = None,
 ) -> int:
     """Crea usuario y roles en una sola transacción."""
     with transaccion() as conn:
@@ -48,7 +51,84 @@ def _crear_usuario_con_roles(
                 ),
                 {"u": int(id_usuario), "r": int(id_rol)},
             )
+        registrar_evento(
+            conn,
+            tipo_evento="USUARIO",
+            entidad="usuarios",
+            id_entidad=int(id_usuario),
+            id_usuario=id_usuario_actor,
+            datos_nuevos={
+                "nombre_usuario": nombre_usuario,
+                "correo": correo,
+                "id_empleado": id_empleado,
+                "roles": sorted(int(r) for r in ids_roles),
+                "activo": True,
+            },
+        )
     return int(id_usuario)
+
+
+def _actualizar_cuenta(
+    *,
+    id_usuario: int,
+    ids_roles: list[int],
+    activo: bool,
+    id_usuario_actor: int | None = None,
+) -> None:
+    """Actualiza roles y estado activo en una sola transacción."""
+    with transaccion() as conn:
+        cuenta = conn.execute(
+            text(
+                "SELECT nombre_usuario, activo FROM usuarios "
+                "WHERE id_usuario = :id FOR UPDATE"
+            ),
+            {"id": int(id_usuario)},
+        ).mappings().first()
+        if cuenta is None:
+            raise ValueError("El usuario seleccionado ya no existe.")
+
+        roles_anteriores = conn.execute(
+            text(
+                "SELECT id_rol FROM usuarios_roles WHERE id_usuario = :id "
+                "ORDER BY id_rol"
+            ),
+            {"id": int(id_usuario)},
+        ).scalars().all()
+        roles_nuevos = sorted(int(r) for r in ids_roles)
+
+        conn.execute(
+            text("DELETE FROM usuarios_roles WHERE id_usuario = :id"),
+            {"id": int(id_usuario)},
+        )
+        for id_rol in roles_nuevos:
+            conn.execute(
+                text(
+                    "INSERT INTO usuarios_roles (id_usuario, id_rol) "
+                    "VALUES (:u, :r)"
+                ),
+                {"u": int(id_usuario), "r": int(id_rol)},
+            )
+        conn.execute(
+            text("UPDATE usuarios SET activo = :activo WHERE id_usuario = :id"),
+            {"activo": bool(activo), "id": int(id_usuario)},
+        )
+        registrar_evento(
+            conn,
+            tipo_evento="USUARIO",
+            entidad="usuarios",
+            id_entidad=int(id_usuario),
+            id_usuario=id_usuario_actor,
+            datos_anteriores={
+                "nombre_usuario": cuenta["nombre_usuario"],
+                "activo": bool(cuenta["activo"]),
+                "roles": [int(r) for r in roles_anteriores],
+            },
+            datos_nuevos={
+                "nombre_usuario": cuenta["nombre_usuario"],
+                "activo": bool(activo),
+                "roles": roles_nuevos,
+            },
+        )
 
 
 def _render_gestion_empleados() -> None:
@@ -210,6 +290,7 @@ def _render_gestion_cuentas() -> None:
             correo=correo.strip() or None,
             password_hash=password_hash,
             ids_roles=[int(rol["id_rol"]) for rol in roles_sel],
+            id_usuario_actor=(usuario_actual() or {}).get("id_usuario"),
         )
     except IntegrityError as exc:
         origen = getattr(exc, "orig", None)
@@ -232,6 +313,80 @@ def _render_gestion_cuentas() -> None:
     st.rerun()
 
 
+def _render_edicion_cuentas() -> None:
+    """Cambio de roles y baja/alta de una cuenta existente."""
+    usuarios = run_query(
+        """
+        SELECT id_usuario, nombre_usuario, activo
+        FROM usuarios
+        ORDER BY nombre_usuario
+        """
+    )
+    roles = run_query(
+        """
+        SELECT id_rol, nombre
+        FROM roles
+        WHERE activo = TRUE
+          AND nombre NOT IN (:limpieza, :inventario)
+        ORDER BY nombre
+        """,
+        {"limpieza": "Limpieza", "inventario": "Inventario"},
+    )
+    if usuarios.empty or roles.empty:
+        return
+
+    with st.expander("Editar roles o estado de una cuenta"):
+        usuario = st.selectbox(
+            "Cuenta",
+            usuarios.to_dict("records"),
+            format_func=lambda u: u["nombre_usuario"],
+            key="editar_usuario_cuenta",
+        )
+        actuales = run_query(
+            "SELECT id_rol FROM usuarios_roles WHERE id_usuario = :id",
+            {"id": int(usuario["id_usuario"])},
+        )
+        ids_actuales = (
+            [int(r) for r in actuales["id_rol"].tolist()]
+            if not actuales.empty
+            else []
+        )
+        with st.form(f"editar_cuenta_{usuario['id_usuario']}"):
+            roles_sel = st.multiselect(
+                "Roles",
+                roles.to_dict("records"),
+                default=[
+                    r for r in roles.to_dict("records")
+                    if int(r["id_rol"]) in ids_actuales
+                ],
+                format_func=lambda r: r["nombre"],
+            )
+            activo = st.checkbox(
+                "Cuenta activa",
+                value=bool(usuario["activo"]),
+            )
+            guardar = st.form_submit_button("Guardar cambios")
+
+        if not guardar:
+            return
+        requerir_accion("usuarios.gestionar")
+        if not roles_sel:
+            st.error("Asigna al menos un rol.")
+            return
+        try:
+            _actualizar_cuenta(
+                id_usuario=int(usuario["id_usuario"]),
+                ids_roles=[int(r["id_rol"]) for r in roles_sel],
+                activo=activo,
+                id_usuario_actor=(usuario_actual() or {}).get("id_usuario"),
+            )
+        except (IntegrityError, SQLAlchemyError, ValueError) as exc:
+            st.error(f"No se pudo actualizar la cuenta: {exc}")
+            return
+        st.success(f"Cuenta '{usuario['nombre_usuario']}' actualizada.")
+        st.rerun()
+
+
 def render():
     requerir_rol(ADMIN, GERENTE)
     st.subheader("👤 Usuarios y roles")
@@ -245,3 +400,4 @@ def render():
 
     with tab_cuentas:
         _render_gestion_cuentas()
+        _render_edicion_cuentas()

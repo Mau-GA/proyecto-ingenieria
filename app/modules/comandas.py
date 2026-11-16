@@ -11,11 +11,10 @@ una orden nueva aparece sin recargar la página. Cada refresco solo lee la
 base de datos; las escrituras únicamente ocurren al pulsar un botón.
 
 Los comentarios/notas de preparación capturados por el mesero se
-recuperan de la bitácora `auditoria`, donde se guardan asociados al
-id del detalle de la orden.
+recuperan de ``detalle_notas``, una fila por partida.
 
 Antes de marcar un producto como listo, Cocina/Bar puede reportarlo como
-merma. Esa marca también vive en `auditoria` y el reporte se envía a la
+merma. Esa marca vive en ``detalle_mermas`` y el reporte se envía a la
 bandeja del Gerente (Inventario > Gestión de Mermas).
 """
 from __future__ import annotations
@@ -97,7 +96,8 @@ def _comandas_por_estado():
         """
         SELECT d.id_detalle, d.id_orden, d.id_producto, d.cantidad,
                p.nombre AS producto, a.nombre AS area, ed.nombre AS estado,
-               m.numero_mesa, n.comentario, mm.merma_motivo,
+               m.numero_mesa, n.comentario,
+               mm.motivo AS merma_motivo,
                cl.nombre AS cliente,
                COALESCE(h.fecha_recepcion, o.fecha_orden) AS fecha_recepcion,
                h.fecha_preparacion, h.fecha_listo,
@@ -155,28 +155,8 @@ def _comandas_por_estado():
             WHERE hh.id_detalle = d.id_detalle
         ) h ON TRUE
         LEFT JOIN usuarios u ON u.id_usuario = h.id_usuario_preparacion
-        LEFT JOIN (
-            SELECT au.id_registro_afectado AS id_detalle,
-                   au.datos_nuevos ->> 'comentario' AS comentario
-            FROM auditoria au
-            JOIN (
-                SELECT id_registro_afectado, MAX(id_auditoria) AS ultimo
-                FROM auditoria
-                WHERE tabla_afectada = 'detalles_orden_comentario'
-                GROUP BY id_registro_afectado
-            ) ult ON ult.ultimo = au.id_auditoria
-        ) n ON n.id_detalle = d.id_detalle
-        LEFT JOIN (
-            SELECT au.id_registro_afectado AS id_detalle,
-                   au.datos_nuevos ->> 'motivo' AS merma_motivo
-            FROM auditoria au
-            JOIN (
-                SELECT id_registro_afectado, MAX(id_auditoria) AS ultimo
-                FROM auditoria
-                WHERE tabla_afectada = 'detalles_orden_merma'
-                GROUP BY id_registro_afectado
-            ) ult ON ult.ultimo = au.id_auditoria
-        ) mm ON mm.id_detalle = d.id_detalle
+        LEFT JOIN detalle_notas n ON n.id_detalle = d.id_detalle
+        LEFT JOIN detalle_mermas mm ON mm.id_detalle = d.id_detalle
         WHERE eo.nombre <> 'Cancelada'
           AND ed.nombre IN ('Pendiente', 'En preparación', 'Listo')
         ORDER BY o.fecha_orden, d.id_detalle

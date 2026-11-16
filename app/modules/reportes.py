@@ -1,17 +1,21 @@
-"""Módulo de Reportes: ventas por rango de fechas y productos más vendidos."""
+"""Módulo de Reportes: ventas, productos más vendidos y bitácora forense."""
 import datetime as dt
+import json
 
 import streamlit as st
 
 from database import run_query
-from permissions import requerir_rol, requerir_accion, ADMIN, GERENTE
+from permissions import (
+    puede_accion,
+    requerir_rol,
+    requerir_accion,
+    ADMIN,
+    GERENTE,
+)
+from services.bitacora import TIPOS_EVENTO, verificar_bitacora
 
 
-def render():
-    requerir_rol(ADMIN, GERENTE)
-    requerir_accion("reportes.ver")
-    st.subheader("📊 Reportes")
-
+def _render_ventas() -> None:
     col1, col2 = st.columns(2)
     with col1:
         desde = st.date_input("Desde", value=dt.date.today() - dt.timedelta(days=30))
@@ -70,3 +74,106 @@ def render():
         st.success("Ningún insumo por debajo de su stock mínimo.")
     else:
         st.dataframe(stock_bajo, use_container_width=True, hide_index=True)
+
+
+def _render_bitacora() -> None:
+    requerir_accion("bitacora.ver")
+    st.caption(
+        "Registro inalterable de eventos. La cadena se verifica contra los "
+        "hashes guardados; cualquier edición directa en la tabla se detecta."
+    )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        desde = st.date_input(
+            "Desde",
+            value=dt.date.today() - dt.timedelta(days=30),
+            key="bitacora_desde",
+        )
+    with c2:
+        hasta = st.date_input(
+            "Hasta",
+            value=dt.date.today(),
+            key="bitacora_hasta",
+        )
+    with c3:
+        tipo = st.selectbox(
+            "Tipo de evento",
+            ["Todos"] + sorted(TIPOS_EVENTO),
+            key="bitacora_tipo",
+        )
+
+    usuarios = run_query(
+        """
+        SELECT DISTINCT nombre_usuario
+        FROM bitacora
+        WHERE nombre_usuario IS NOT NULL
+        ORDER BY nombre_usuario
+        """
+    )
+    opciones_usuario = ["Todos"]
+    if not usuarios.empty:
+        opciones_usuario += usuarios["nombre_usuario"].tolist()
+    usuario = st.selectbox(
+        "Usuario",
+        opciones_usuario,
+        key="bitacora_usuario",
+    )
+
+    registros = run_query(
+        """
+        SELECT id_bitacora, fecha, nombre_usuario, tipo_evento, entidad,
+               id_entidad, datos_anteriores, datos_nuevos, hash_anterior, hash
+        FROM bitacora
+        WHERE DATE(fecha) BETWEEN :desde AND :hasta
+          AND (:tipo = 'Todos' OR tipo_evento = :tipo)
+          AND (:usuario = 'Todos' OR nombre_usuario = :usuario)
+        ORDER BY id_bitacora DESC
+        LIMIT 500
+        """,
+        {
+            "desde": desde,
+            "hasta": hasta,
+            "tipo": tipo,
+            "usuario": usuario,
+        },
+    )
+
+    if st.button("🔎 Verificar integridad de la cadena", key="verificar_bitacora"):
+        id_alterado = verificar_bitacora()
+        if id_alterado is None:
+            st.success("Cadena de hashes intacta.")
+        else:
+            st.error(
+                "La cadena de hashes está alterada. Primer registro inconsistente: "
+                f"id_bitacora={id_alterado}."
+            )
+
+    if registros.empty:
+        st.info("No hay eventos en el rango y filtros seleccionados.")
+        return
+
+    vista = registros.copy()
+    for columna in ("datos_anteriores", "datos_nuevos"):
+        vista[columna] = vista[columna].apply(
+            lambda valor: "" if valor is None else json.dumps(
+                valor, ensure_ascii=False, sort_keys=True
+            )
+        )
+    st.caption(f"Mostrando {len(vista)} evento(s), del más reciente al más antiguo.")
+    st.dataframe(vista, use_container_width=True, hide_index=True)
+
+
+def render():
+    requerir_rol(ADMIN, GERENTE)
+    requerir_accion("reportes.ver")
+    st.subheader("📊 Reportes")
+
+    if puede_accion("bitacora.ver"):
+        tab_ventas, tab_bitacora = st.tabs(["💰 Ventas", "🔐 Bitácora"])
+        with tab_ventas:
+            _render_ventas()
+        with tab_bitacora:
+            _render_bitacora()
+    else:
+        _render_ventas()

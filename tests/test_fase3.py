@@ -187,9 +187,7 @@ def test_extra_sin_stock_revierte_toda_la_orden():
     ordenes_antes = _contar("ordenes")
     detalles_antes = _contar("detalles_orden")
     fotos_antes = _contar("detalle_modificadores")
-    auditoria_antes = _contar(
-        "auditoria WHERE tabla_afectada = 'detalles_orden_consumo'"
-    )
+    consumo_antes = _contar("detalle_consumo")
 
     with pytest.raises(StockInsuficienteError) as exc:
         _crear_cuenta(id_producto=1, precio=120.00, modificadores=[3])
@@ -198,9 +196,7 @@ def test_extra_sin_stock_revierte_toda_la_orden():
     assert _contar("ordenes") == ordenes_antes
     assert _contar("detalles_orden") == detalles_antes
     assert _contar("detalle_modificadores") == fotos_antes
-    assert _contar(
-        "auditoria WHERE tabla_afectada = 'detalles_orden_consumo'"
-    ) == auditoria_antes
+    assert _contar("detalle_consumo") == consumo_antes
 
 
 def test_rechaza_modificador_ajeno_inactivo_o_repetido_sin_insertar():
@@ -272,9 +268,7 @@ def test_eliminar_partida_personalizada_devuelve_lo_descontado_aunque_cambie_rec
         {"d": id_detalle},
     ) == 0
     assert _escalar(
-        "SELECT COUNT(*) FROM auditoria "
-        "WHERE tabla_afectada = 'detalles_orden_consumo' "
-        "AND id_registro_afectado = :d",
+        "SELECT COUNT(*) FROM detalle_consumo WHERE id_detalle = :d",
         {"d": id_detalle},
     ) == 0
     _assert_stock_igual_movimientos(id_orden, inicial)
@@ -335,14 +329,12 @@ def test_mermar_personalizada_no_toca_stock_y_repetir_mantiene_modificadores():
 
     pendientes = _filas(
         """
-        SELECT datos_nuevos ->> 'id_insumo' AS insumo,
-               datos_nuevos ->> 'cantidad' AS cantidad
-        FROM auditoria
-        WHERE tabla_afectada = 'mermas_pendientes'
-          AND datos_nuevos ->> 'id_detalle' = :detalle
-        ORDER BY insumo
+        SELECT id_insumo AS insumo, cantidad
+        FROM mermas_pendientes
+        WHERE id_detalle = :detalle
+        ORDER BY id_insumo
         """,
-        {"detalle": str(id_detalle)},
+        {"detalle": int(id_detalle)},
     )
     por_insumo = {int(fila[0]): Decimal(str(fila[1])) for fila in pendientes}
     assert 4 not in por_insumo

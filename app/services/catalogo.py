@@ -12,6 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from database import transaccion
+from services.bitacora import registrar_evento
 
 
 class CatalogoError(Exception):
@@ -37,6 +38,7 @@ def actualizar_producto(
     id_area_preparacion: int,
     precio,
     disponible: bool,
+    id_usuario: int | None = None,
 ) -> None:
     """Actualiza los datos editables de un producto sin tocar ventas pasadas."""
     nombre_limpio = (nombre or "").strip()
@@ -45,6 +47,16 @@ def actualizar_producto(
     precio_dec = _precio_valido(precio)
 
     with transaccion() as conn:
+        anterior = conn.execute(
+            text(
+                "SELECT precio_actual FROM productos "
+                "WHERE id_producto = :id FOR UPDATE"
+            ),
+            {"id": int(id_producto)},
+        ).scalar_one_or_none()
+        if anterior is None:
+            raise CatalogoError("El producto seleccionado no existe.")
+
         try:
             resultado = conn.execute(
                 text(
@@ -76,6 +88,18 @@ def actualizar_producto(
             ) from exc
         if int(resultado.rowcount or 0) == 0:
             raise CatalogoError("El producto seleccionado no existe.")
+
+        precio_anterior = Decimal(str(anterior))
+        if precio_anterior != precio_dec:
+            registrar_evento(
+                conn,
+                tipo_evento="CAMBIO_PRECIO",
+                entidad="productos",
+                id_entidad=int(id_producto),
+                id_usuario=id_usuario,
+                datos_anteriores={"precio_actual": precio_anterior},
+                datos_nuevos={"precio_actual": precio_dec},
+            )
 
 
 def crear_categoria(nombre: str, descripcion: str | None = None) -> int:

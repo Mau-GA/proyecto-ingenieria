@@ -624,12 +624,14 @@ def _render_cuentas_abiertas(
         SELECT o.id_orden, o.id_mesa, o.total, o.fecha_orden,
                o.numero_orden_diaria AS numero_dia,
                m.numero_mesa, t.nombre AS tipo, e.nombre AS estado,
-               pe.nombre AS plataforma, o.referencia_externa
+               pe.nombre AS plataforma, o.referencia_externa,
+               c.nombre AS cliente
         FROM ordenes o
         JOIN estados_orden e ON e.id_estado = o.id_estado
         JOIN tipos_orden t ON t.id_tipo_orden = o.id_tipo_orden
         LEFT JOIN mesas m ON m.id_mesa = o.id_mesa
         LEFT JOIN plataformas_externas pe ON pe.id_plataforma = o.id_plataforma_externa
+        LEFT JOIN clientes c ON c.id_cliente = o.id_cliente
         WHERE e.es_final = FALSE
           AND (
               (:solo_mesas = 1 AND o.id_mesa IS NOT NULL)
@@ -661,9 +663,12 @@ def _render_cuentas_abiertas(
         else:
             plataforma = _texto(orden["plataforma"])
             referencia = _texto(orden["referencia_externa"])
+            cliente = _texto(orden["cliente"])
             ubicacion = plataforma or "Delivery"
             if referencia:
                 ubicacion += f" · Pedido {referencia}"
+            if cliente:
+                ubicacion += f" · Cliente {cliente}"
 
         with st.container(border=True):
             c1, c2, c3, c4 = st.columns([2, 2, 3, 1])

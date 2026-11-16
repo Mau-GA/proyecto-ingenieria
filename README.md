@@ -11,6 +11,13 @@ restaurante en un sistema web funcional con Streamlit + PostgreSQL + Docker.
 
 ## 0. Cambios de esta versión
 
+- **KDS / Comandas (Fase 4):** historial de estados por partida
+  (`historial_estado_detalle`), cambio de estado con secuencia validada y
+  control de concurrencia, colores por tiempo de espera configurables
+  (`configuracion_kds`), actualización automática cada 2 segundos con
+  `st.fragment(run_every=2)` y nombre del cliente en pedidos de delivery.
+  La configuración de umbrales vive dentro de **Comandas** y requiere el
+  permiso `kds.configurar` (Gerente/Administrador).
 - **Personalización de productos (Fase 3):** catálogo de modificadores por
   producto (`Quitar`, `Extra`, `Sustituir`) con cargo adicional opcional.
   Cada partida guarda una foto histórica en `detalle_modificadores`; el
@@ -38,6 +45,17 @@ restaurante en un sistema web funcional con Streamlit + PostgreSQL + Docker.
 - Docker: healthcheck con Python (la imagen slim no trae `curl`), PostgreSQL
   16 con UTF8/citext, puerto de BD solo en `127.0.0.1`, validación de
   variables obligatorias del `.env`.
+
+> **Si vienes de una versión anterior (Fases 1–3), recrea el volumen** para
+> que se creen las tablas `historial_estado_detalle` y `configuracion_kds`:
+>
+> ```bash
+> docker compose down -v && docker compose up -d --build
+> docker compose exec app python crear_usuarios_prueba.py
+> ```
+>
+> `down -v` **borra los datos** de la base. Después vuelve a fijar la
+> contraseña de `admin` con `set_admin_password.py` si la necesitas.
 
 ---
 

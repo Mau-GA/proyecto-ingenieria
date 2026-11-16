@@ -224,6 +224,7 @@ def _render_ticket(catalogos: dict, auth: dict) -> None:
 
     id_mesa = id_plataforma = None
     referencia_externa = None
+    nombre_cliente = None
     if tipo["requiere_mesa"]:
         mesas = cargar_mesas_disponibles()
         if mesas.empty:
@@ -242,6 +243,18 @@ def _render_ticket(catalogos: dict, auth: dict) -> None:
                                          format_func=plataformas.get, key="foodhouse_plataforma")
         referencia_externa = st.text_input("Número de pedido en la plataforma", max_chars=50,
                                            key="foodhouse_ref_ext")
+        nombre_cliente = st.text_input(
+            "Nombre del cliente *",
+            max_chars=100,
+            key="foodhouse_cliente",
+        )
+        st.caption("Obligatorio para pedidos de plataforma externa.")
+    else:
+        nombre_cliente = st.text_input(
+            "Nombre del cliente (opcional)",
+            max_chars=100,
+            key="foodhouse_cliente",
+        )
 
     # --- Partidas ---
     carrito = st.session_state[K_CARRITO]
@@ -273,6 +286,8 @@ def _render_ticket(catalogos: dict, auth: dict) -> None:
             errores.append("Este tipo de orden requiere mesa.")
         if tipo["requiere_plataforma"] and (id_plataforma is None or not referencia_externa):
             errores.append("Indica plataforma y número de pedido.")
+        if tipo["requiere_plataforma"] and not (nombre_cliente or "").strip():
+            errores.append("Indica el nombre del cliente.")
         if errores:
             for e in errores:
                 st.error(e)
@@ -287,6 +302,7 @@ def _render_ticket(catalogos: dict, auth: dict) -> None:
                 id_mesa=id_mesa,
                 id_plataforma=id_plataforma,
                 referencia_externa=referencia_externa,
+                nombre_cliente=nombre_cliente,
             )
         except StockInsuficienteError as exc:
             st.error("No se registró la comanda: no alcanza el inventario.")

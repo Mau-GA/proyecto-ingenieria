@@ -74,6 +74,11 @@ INSERT INTO estados_detalle_orden (id_estado, nombre, es_final) VALUES
 (4, 'Entregado', TRUE),
 (5, 'Cancelado', TRUE);
 
+-- Umbrales del semáforo de tiempos del KDS: verde < 10 min,
+-- amarillo entre 10 y 19 min, rojo desde 20 min.
+INSERT INTO configuracion_kds (id_configuracion, umbral_amarillo_min, umbral_rojo_min) VALUES
+(1, 10, 20);
+
 INSERT INTO tipos_orden (id_tipo_orden, nombre, requiere_mesa, requiere_plataforma) VALUES
 (1, 'Local', TRUE, FALSE),
 (2, 'Para Llevar', FALSE, FALSE),

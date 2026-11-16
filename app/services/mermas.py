@@ -35,6 +35,7 @@ from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Connection
 
 from database import transaccion
+from services.cocina import registrar_historial_pendiente
 from services.modificadores import foto_de_detalle, guardar_foto_modificadores
 from services.ventas import (
     StockInsuficienteError,
@@ -414,13 +415,22 @@ def registrar_merma_detalle(
                 )
 
         if repetir:
-            _repetir_detalle_en(conn, id_detalle, id_empleado=id_empleado)
+            _repetir_detalle_en(
+                conn,
+                id_detalle,
+                id_empleado=id_empleado,
+                id_usuario=id_usuario,
+            )
 
     return ids_mermas
 
 
 def _repetir_detalle_en(
-    conn: Connection, id_detalle: int, *, id_empleado: int | None
+    conn: Connection,
+    id_detalle: int,
+    *,
+    id_empleado: int | None,
+    id_usuario: int | None = None,
 ) -> int:
     """Crea la reposición y descuenta su receta dentro de la transacción actual."""
     fila = conn.execute(
@@ -515,6 +525,14 @@ def _repetir_detalle_en(
         },
     ).scalar_one()
     id_nuevo = int(id_nuevo)
+    # La reposición también nace en "Pendiente" y debe aparecer en Comandas
+    # con su propia hora de recepción.
+    registrar_historial_pendiente(
+        conn,
+        id_detalle=id_nuevo,
+        id_usuario=id_usuario,
+        id_estado=int(id_pendiente),
+    )
     guardar_foto_modificadores(conn, id_nuevo, foto_modificadores)
     if foto_modificadores:
         consumo = calcular_consumo(
@@ -596,7 +614,9 @@ def _repetir_detalle_en(
     return id_nuevo
 
 
-def repetir_detalle_mermado(*, id_detalle: int) -> int:
+def repetir_detalle_mermado(
+    *, id_detalle: int, id_usuario: int | None = None
+) -> int:
     """Clona una partida mermada y descuenta la receta de la reposición."""
     with transaccion() as conn:
         empleado = conn.execute(
@@ -618,7 +638,10 @@ def repetir_detalle_mermado(*, id_detalle: int) -> int:
                 "no se puede descontar la reposición."
             )
         return _repetir_detalle_en(
-            conn, int(id_detalle), id_empleado=int(empleado)
+            conn,
+            int(id_detalle),
+            id_empleado=int(empleado),
+            id_usuario=id_usuario,
         )
 
 

@@ -35,6 +35,7 @@ from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Connection
 
 from database import get_engine, transaccion
+from services.cocina import registrar_historial_pendiente
 from services.modificadores import (
     ModificadorError,
     foto_de_detalle,
@@ -643,6 +644,14 @@ def agregar_partidas(
             },
         )
         id_detalle = int(resultado.scalar_one())
+        # La fila "Pendiente" es la hora de recepción en cocina y debe nacer
+        # junto con la partida, dentro de esta misma transacción.
+        registrar_historial_pendiente(
+            conn,
+            id_detalle=id_detalle,
+            id_usuario=id_usuario,
+            id_estado=id_pendiente,
+        )
         guardar_foto_modificadores(conn, id_detalle, foto)
         if foto:
             consumo_partida = calcular_consumo(
@@ -766,14 +775,49 @@ def registrar_comanda(
     id_mesa: int | None = None,
     id_plataforma: int | None = None,
     referencia_externa: str | None = None,
+    nombre_cliente: str | None = None,
 ) -> dict:
     """Registra una comanda que queda pendiente de cobro (FoodHouse).
 
     Crea la orden en estado 'Pendiente' (sin pago), inserta sus partidas ya
     desglosadas 1 a 1, descuenta inventario y asigna el número de orden del
     día. El cobro posterior se hace desde Órdenes.
+
+    ``nombre_cliente`` es obligatorio para pedidos de plataforma externa y
+    opcional para "Para Llevar". Cuando viene, se crea un registro nuevo en
+    ``clientes`` y se enlaza con ``ordenes.id_cliente`` en la misma
+    transacción; no se buscan ni reutilizan clientes existentes.
     """
+    nombre_cliente = (nombre_cliente or "").strip() or None
+
     with transaccion() as conn:
+        tipo = conn.execute(
+            text(
+                "SELECT nombre, requiere_plataforma FROM tipos_orden "
+                "WHERE id_tipo_orden = :tipo"
+            ),
+            {"tipo": id_tipo_orden},
+        ).mappings().first()
+        if tipo is None:
+            raise VentaError("El tipo de orden seleccionado no existe.")
+        if bool(tipo["requiere_plataforma"]) and not nombre_cliente:
+            raise VentaError(
+                "El nombre del cliente es obligatorio para pedidos de "
+                "plataforma externa."
+            )
+
+        id_cliente = None
+        if nombre_cliente:
+            id_cliente = int(
+                conn.execute(
+                    text(
+                        "INSERT INTO clientes (nombre) VALUES (:nombre) "
+                        "RETURNING id_cliente"
+                    ),
+                    {"nombre": nombre_cliente},
+                ).scalar_one()
+            )
+
         id_pendiente = _id_por_nombre(
             conn, "SELECT id_estado FROM estados_orden WHERE nombre = :n", "Pendiente"
         )
@@ -781,18 +825,19 @@ def registrar_comanda(
         res = conn.execute(
             text(
                 """
-                INSERT INTO ordenes (id_tipo_orden, id_mesa, id_empleado_atiende,
-                                     id_usuario_registro, id_plataforma_externa,
-                                     referencia_externa, id_estado, total,
-                                     numero_orden_diaria)
-                VALUES (:tipo, :mesa, :empleado, :usuario, :plataforma, :ref_ext,
-                        :estado, 0, :numero_dia)
+                INSERT INTO ordenes (id_tipo_orden, id_mesa, id_cliente,
+                                     id_empleado_atiende, id_usuario_registro,
+                                     id_plataforma_externa, referencia_externa,
+                                     id_estado, total, numero_orden_diaria)
+                VALUES (:tipo, :mesa, :cliente, :empleado, :usuario,
+                        :plataforma, :ref_ext, :estado, 0, :numero_dia)
                 RETURNING id_orden, numero_orden_diaria
                 """
             ),
             {
-                "tipo": id_tipo_orden, "mesa": id_mesa, "empleado": id_empleado,
-                "usuario": id_usuario, "plataforma": id_plataforma,
+                "tipo": id_tipo_orden, "mesa": id_mesa, "cliente": id_cliente,
+                "empleado": id_empleado, "usuario": id_usuario,
+                "plataforma": id_plataforma,
                 "ref_ext": referencia_externa or None, "estado": id_pendiente,
                 "numero_dia": numero_dia,
             },
@@ -813,6 +858,8 @@ def registrar_comanda(
         "numero_dia": numero_dia,
         "total": total,
         "inventario": resumen,
+        "id_cliente": id_cliente,
+        "nombre_cliente": nombre_cliente,
     }
 
 
@@ -1074,8 +1121,12 @@ def modificar_cantidad_partida(
     return total
 
 
-def limpiar_comandas_listas() -> int:
-    """Pasa todas las partidas en ``Listo`` a ``Entregado`` en una transacción."""
+def limpiar_comandas_listas(id_usuario: int | None = None) -> int:
+    """Pasa todas las partidas en ``Listo`` a ``Entregado`` en una transacción.
+
+    Registra una fila de historial por cada partida movida para que el KDS
+    conserve la hora y el usuario de la entrega.
+    """
     with transaccion() as conn:
         id_listo = _id_por_nombre(
             conn,
@@ -1087,12 +1138,42 @@ def limpiar_comandas_listas() -> int:
             "SELECT id_estado FROM estados_detalle_orden WHERE nombre = :n",
             "Entregado",
         )
+        ids = [
+            int(valor)
+            for valor in conn.execute(
+                text(
+                    "SELECT id_detalle FROM detalles_orden "
+                    "WHERE id_estado = :listo FOR UPDATE"
+                ),
+                {"listo": id_listo},
+            ).scalars()
+        ]
+        if not ids:
+            return 0
+
         resultado = conn.execute(
             text(
                 "UPDATE detalles_orden SET id_estado = :entregado "
                 "WHERE id_estado = :listo"
             ),
             {"entregado": id_entregado, "listo": id_listo},
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO historial_estado_detalle
+                    (id_detalle, id_estado, id_usuario)
+                VALUES (:detalle, :estado, :usuario)
+                """
+            ),
+            [
+                {
+                    "detalle": id_detalle,
+                    "estado": id_entregado,
+                    "usuario": id_usuario,
+                }
+                for id_detalle in ids
+            ],
         )
         return int(resultado.rowcount or 0)
 

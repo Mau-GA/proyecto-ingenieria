@@ -20,7 +20,7 @@ proyectorestaurante/
 ├── .env.example              ← plantilla de variables (copiar a .env)
 ├── .dockerignore / .gitignore
 ├── db/
-│   ├── schema.sql            ← 33 tablas normalizadas (3FN)
+│   ├── schema.sql            ← 35 tablas normalizadas (3FN)
 │   └── seed.sql              ← catálogos + datos de prueba
 └── app/
     ├── app.py                ← entrada: conexión → login → menú por rol
@@ -244,6 +244,19 @@ docker compose exec app python crear_usuarios_prueba.py
 > las tablas `modificadores_producto` y `detalle_modificadores` y se carguen
 > los modificadores de ejemplo. `crear_usuarios_prueba.py` es idempotente y
 > deja las cuentas de prueba listas.
+>
+> **Fase 4 (KDS):** el cambio de esquema agrega `historial_estado_detalle` y
+> `configuracion_kds`, además de la fila de umbrales en `seed.sql`. Los
+> scripts de `db/` solo corren con el volumen vacío, así que después de
+> actualizar el código ejecuta:
+>
+> ```bash
+> docker compose down -v && docker compose up -d --build
+> docker compose exec app python crear_usuarios_prueba.py
+> ```
+>
+> `down -v` **borra los datos** existentes. Vuelve a fijar la contraseña de
+> `admin` con `set_admin_password.py` si la usas para entrar.
 
 ---
 

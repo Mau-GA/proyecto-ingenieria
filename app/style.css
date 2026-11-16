@@ -63,3 +63,45 @@ div[data-testid="stMetric"], .pos-card {
     letter-spacing: 0.6px;
     margin-right: 0.4rem;
 }
+
+/* --- Semáforo de tiempos del KDS (Comandas) ---
+   El texto de los minutos acompaña siempre al color, para que la
+   información no dependa únicamente del tono. */
+.kds-espera {
+    display: inline-block;
+    border-radius: 999px;
+    padding: 0.18rem 0.7rem;
+    margin-top: 0.35rem;
+    font-size: 0.8rem;
+    font-weight: 700;
+    border: 1px solid transparent;
+}
+
+.kds-verde {
+    background: rgba(46, 204, 113, 0.16);
+    border-color: #2ecc71;
+    color: #7ff0b1;
+}
+
+.kds-amarillo {
+    background: rgba(241, 196, 15, 0.16);
+    border-color: #f1c40f;
+    color: #ffe17a;
+}
+
+.kds-rojo {
+    background: rgba(255, 90, 95, 0.20);
+    border-color: var(--accent);
+    color: #ff9aa0;
+}
+
+/* Tiñe también el borde de la tarjeta que contiene el indicador. */
+div[data-testid="stVerticalBlockBorderWrapper"]:has(.kds-verde) {
+    border-left: 6px solid #2ecc71;
+}
+div[data-testid="stVerticalBlockBorderWrapper"]:has(.kds-amarillo) {
+    border-left: 6px solid #f1c40f;
+}
+div[data-testid="stVerticalBlockBorderWrapper"]:has(.kds-rojo) {
+    border-left: 6px solid var(--accent);
+}

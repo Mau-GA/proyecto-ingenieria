@@ -12,6 +12,7 @@ pandas==2.2.3             # run_query() regresa DataFrames (usado por todos los 
 # --- Configuración y seguridad ---
 python-dotenv==1.0.1      # Carga .env en desarrollo local sin Docker
 bcrypt==4.2.0             # Hash de contraseñas de usuarios
+fpdf2==2.7.9              # Exportación de reportes a PDF
 
 # --- Pruebas ---
 pytest==8.3.3

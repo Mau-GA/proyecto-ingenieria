@@ -57,6 +57,7 @@ from services.ventas import (
     guardar_orden_mesa,
     modificar_cantidad_partida,
     porciones_disponibles,
+    registrar_pago_parcial,
 )
 
 
@@ -138,6 +139,50 @@ def _pendientes_de_cobro(id_orden: int) -> int:
         {"orden": id_orden},
     )
     return 0 if fila.empty else int(fila.iloc[0]["pendientes"])
+
+
+def _pagos_de_orden(id_orden: int):
+    """Abonos de la orden con método, importe, referencia y hora."""
+    return run_query(
+        """
+        SELECT p.id_pago, mp.nombre AS metodo, p.monto,
+               COALESCE(p.referencia_pago, '') AS referencia,
+               p.fecha_pago
+        FROM pagos p
+        JOIN metodos_pago mp ON mp.id_metodo_pago = p.id_metodo_pago
+        WHERE p.id_orden = :orden
+        ORDER BY p.fecha_pago, p.id_pago
+        """,
+        {"orden": int(id_orden)},
+    )
+
+
+def _comprobante_txt(
+    numero_orden: int, total: float, pagos, id_mesa: int | None
+) -> str:
+    """Genera el comprobante descargable del pago dividido."""
+    lineas = [
+        "Los Bro's Restaurant",
+        f"Comprobante de pago — Orden #{numero_orden}",
+        f"Total: ${total:.2f}",
+        f"Pagado: ${sum(float(p['monto']) for _, p in pagos.iterrows()):.2f}",
+        f"Saldo: $0.00",
+        "",
+        "Abonos:",
+    ]
+    if id_mesa is not None:
+        lineas.insert(2, f"Mesa: {id_mesa}")
+    for _, pago in pagos.iterrows():
+        fecha = pago["fecha_pago"]
+        hora = fecha.strftime("%Y-%m-%d %H:%M") if hasattr(fecha, "strftime") else str(fecha)
+        referencia = _texto(pago["referencia"])
+        detalle = f"- {pago['metodo']}: ${float(pago['monto']):.2f} · {hora}"
+        if referencia:
+            detalle += f" · Ref. {referencia}"
+        lineas.append(detalle)
+    lineas.append("")
+    lineas.append("Gracias por su visita.")
+    return "\n".join(lineas)
 
 
 def _render_detalles(
@@ -506,7 +551,7 @@ def _render_constructor_orden(id_mesa: int):
 
 
 def _render_cobro(orden, id_mesa: int | None) -> None:
-    """Calculadora de efectivo y cobro integrados en la tarjeta de la orden."""
+    """Cobro completo y pago dividido integrados en la tarjeta de la orden."""
     requerir_accion("ordenes.cobrar")
     id_orden = int(orden["id_orden"])
     numero_orden = int(orden["numero_dia"])
@@ -535,6 +580,19 @@ def _render_cobro(orden, id_mesa: int | None) -> None:
         st.error("No hay métodos de pago activos.")
         return
 
+    pagos_actuales = _pagos_de_orden(id_orden)
+    pagado = (
+        0.0
+        if pagos_actuales.empty
+        else float(pagos_actuales["monto"].apply(lambda v: float(v)).sum())
+    )
+    saldo = max(total - pagado, 0.0)
+    if pagado > 0:
+        st.caption(
+            f"Total ${total:.2f} · Pagado ${pagado:.2f} · "
+            f"Saldo pendiente ${saldo:.2f}"
+        )
+
     metodo = st.selectbox(
         "Método de pago",
         metodos.to_dict("records"),
@@ -559,7 +617,7 @@ def _render_cobro(orden, id_mesa: int | None) -> None:
             format="%.2f",
             key=f"cobro_recibido_{id_orden}",
         )
-        cambio = recibido - total
+        cambio = recibido - saldo
         if recibido > 0:
             st.caption(f"Cambio: ${max(cambio, 0):.2f}")
 
@@ -569,7 +627,7 @@ def _render_cobro(orden, id_mesa: int | None) -> None:
             st.error("Este método de pago requiere referencia.")
             return
         if es_efectivo and cambio is not None and cambio < 0:
-            st.error("El efectivo recibido es menor al total.")
+            st.error("El efectivo recibido es menor al saldo pendiente.")
             return
 
         auth = usuario_actual()
@@ -600,6 +658,137 @@ def _render_cobro(orden, id_mesa: int | None) -> None:
         else:
             st.success(f"Orden #{numero_orden} cobrado.")
         st.rerun()
+
+    with st.expander("💳 Pago dividido"):
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total", f"${total:.2f}")
+        c2.metric("Pagado", f"${pagado:.2f}")
+        c3.metric("Saldo", f"${saldo:.2f}")
+        if pagos_actuales.empty:
+            st.caption("Aún no hay abonos registrados.")
+        else:
+            vista_pagos = pagos_actuales.copy()
+            vista_pagos["fecha_pago"] = vista_pagos["fecha_pago"].apply(
+                lambda f: f.strftime("%Y-%m-%d %H:%M") if hasattr(f, "strftime") else str(f)
+            )
+            vista_pagos = vista_pagos.rename(
+                columns={
+                    "metodo": "Método",
+                    "monto": "Monto",
+                    "referencia": "Referencia",
+                    "fecha_pago": "Hora",
+                }
+            )
+            st.dataframe(
+                vista_pagos[["Método", "Monto", "Referencia", "Hora"]],
+                hide_index=True,
+                use_container_width=True,
+            )
+
+        if saldo > 0:
+            metodo_abono = st.selectbox(
+                "Método del abono",
+                metodos.to_dict("records"),
+                format_func=lambda m: m["nombre"],
+                key=f"abono_metodo_{id_orden}",
+            )
+            referencia_abono = None
+            if metodo_abono["requiere_referencia"]:
+                referencia_abono = st.text_input(
+                    "Referencia del abono",
+                    max_chars=100,
+                    key=f"abono_referencia_{id_orden}",
+                )
+            monto_abono = st.number_input(
+                "Monto a abonar",
+                min_value=0.01,
+                max_value=float(saldo),
+                value=float(saldo),
+                step=10.0,
+                format="%.2f",
+                key=f"abono_monto_{id_orden}",
+            )
+            cambio_abono = None
+            if metodo_abono["nombre"] == "Efectivo":
+                recibido_abono = st.number_input(
+                    "Efectivo recibido para este abono",
+                    min_value=0.0,
+                    value=float(monto_abono),
+                    step=10.0,
+                    format="%.2f",
+                    key=f"abono_recibido_{id_orden}",
+                )
+                cambio_abono = float(recibido_abono) - float(monto_abono)
+                st.caption(
+                    "Cambio: "
+                    f"${max(cambio_abono, 0):.2f} · se abonan "
+                    f"${float(monto_abono):.2f} al saldo"
+                )
+
+            if st.button(
+                "Registrar abono",
+                key=f"abono_boton_{id_orden}",
+                use_container_width=True,
+            ):
+                if (
+                    metodo_abono["requiere_referencia"]
+                    and not (referencia_abono or "").strip()
+                ):
+                    st.error("Este método de pago requiere referencia.")
+                    return
+                if cambio_abono is not None and cambio_abono < 0:
+                    st.error("El efectivo recibido es menor al monto del abono.")
+                    return
+                auth = usuario_actual()
+                try:
+                    resultado = registrar_pago_parcial(
+                        id_orden=id_orden,
+                        id_mesa=id_mesa,
+                        id_metodo_pago=int(metodo_abono["id_metodo_pago"]),
+                        monto=float(monto_abono),
+                        id_usuario=auth["id_usuario"],
+                        referencia_pago=referencia_abono,
+                    )
+                except (VentaError, SQLAlchemyError) as exc:
+                    st.error(f"No se pudo registrar el abono: {exc}")
+                    return
+
+                if resultado["pagada"]:
+                    pagos_finales = _pagos_de_orden(id_orden)
+                    texto = _comprobante_txt(
+                        numero_orden, total, pagos_finales, id_mesa
+                    )
+                    st.success(
+                        f"Orden #{numero_orden} pagada. Mesa liberada."
+                        if id_mesa is not None
+                        else f"Orden #{numero_orden} pagada."
+                    )
+                    st.dataframe(
+                        pagos_finales.rename(
+                            columns={
+                                "metodo": "Método",
+                                "monto": "Monto",
+                                "referencia": "Referencia",
+                                "fecha_pago": "Hora",
+                            }
+                        )[["Método", "Monto", "Referencia", "Hora"]],
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+                    st.download_button(
+                        "Descargar comprobante (.txt)",
+                        data=texto,
+                        file_name=f"comprobante_orden_{numero_orden}.txt",
+                        mime="text/plain",
+                        key=f"comprobante_{id_orden}",
+                    )
+                    st.session_state.pop("mesa_seleccionada", None)
+                else:
+                    st.success(
+                        f"Abono registrado. Saldo pendiente: "
+                        f"${float(resultado['saldo_restante']):.2f}"
+                    )
+                    st.rerun()
 
 
 def _render_cancelacion(orden) -> None:

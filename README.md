@@ -11,6 +11,19 @@ restaurante en un sistema web funcional con Streamlit + PostgreSQL + Docker.
 
 ## 0. Cambios de esta versión
 
+- **Pago dividido y reportes (Fase 7):** en **Órdenes** el cobro ahora muestra
+  total, pagado y saldo; el desplegable **💳 Pago dividido** permite registrar
+  abonos con método y referencia, valida que no superen el saldo y cierra la
+  orden automáticamente al llegar a cero. Al finalizar se puede descargar un
+  comprobante `.txt`. Las reducciones o cancelaciones con abonos registrados
+  se bloquean para evitar inconsistencias. **Reportes → Ventas** agrega
+  filtros por fecha, hora y producto, métricas, gráficas de ventas por día,
+  hora, método y top 10 de productos, además de exportación CSV/PDF. La nueva
+  pestaña **Reportes → Compras semanales** calcula el consumo ponderado de las
+  últimas 4 semanas, el stock de seguridad y la necesidad neta por insumo
+  activo, agrupada por proveedor preferente y con subtotales y total general;
+  también exporta CSV/PDF. Esta fase no cambia el esquema, por lo que no hace
+  falta recrear el volumen.
 - **Proveedores, lotes y caducidad (Fase 6):** nueva pestaña **Compras →
   Proveedores** (`proveedores.gestionar`, Administrador/Gerente) con alta,
   edición, baja lógica, condiciones, vínculos insumo-proveedor y costo
@@ -182,7 +195,10 @@ proyectorestaurante/
     ├── set_admin_password.py   Utilidad para fijar la clave de admin
     ├── .streamlit/config.toml  Tema oscuro nativo de Streamlit
     ├── services/
-    │   ├── ventas.py           Venta, inventario, cobro (transaccional)
+    │   ├── ventas.py           Venta, inventario, cobro y abonos (transaccional)
+    │   ├── ventas_reportes.py  Datos, CSV y PDF del reporte de ventas
+    │   ├── compras_semanales.py Sugerencia, CSV y PDF de compras semanales
+    │   ├── reportes_pdf.py     Utilidades compartidas de PDF (fpdf2)
     │   ├── modificadores.py    Catálogo, validación y foto por partida
     │   └── mermas.py           Mermas y reposición con la foto histórica
     ├── modules/
@@ -293,8 +309,37 @@ hacia `main`. **Nunca subir `.env`** (ya está en `.gitignore`).
   referencia promedio en la misma transacción. La pestaña **Proveedores**
   administra el directorio, condiciones, vínculos y costos acordados.
 - **Usuarios** (solo Administrador): usuarios, roles y empleados.
-- **Reportes:** total cobrado, desglose por método de pago, productos más
-  vendidos e insumos con stock bajo.
+- **Reportes:** ventas con filtros de fecha, hora y producto; total cobrado,
+  ticket promedio, unidades, gráficas por día/hora/método, top 10 de productos
+  e insumos con stock bajo. Incluye **Compras semanales** (solo insumos con
+  necesidad neta > 0, agrupados por proveedor preferente) y **Bitácora**. Las
+  ventas y compras se pueden descargar en CSV o PDF.
+
+### Pago dividido paso a paso
+
+1. En **Órdenes**, abre la cuenta y verifica que todas las partidas estén en
+   `Listo` o `Entregado` (los productos mermados no bloquean el cobro).
+2. Despliega **💳 Pago dividido** y elige método, monto y referencia si el
+   método la exige. El saldo se calcula siempre en la base de datos a partir
+   de los pagos registrados.
+3. Pulsa **Registrar abono**. Si el abono deja saldo, la orden sigue abierta;
+   si llega a cero, queda `Pagada` y la mesa se libera según la regla normal.
+4. Al finalizar se muestra el comprobante descargable en `.txt` con todos los
+   abonos. Si la orden ya tiene pagos, no se puede reducir su total por debajo
+   de lo abonado ni cancelarla sin reembolso.
+
+### Reportes de ventas y compras semanales
+
+- **Ventas:** solo cuentan órdenes `Pagada` con pagos cuya `fecha_pago` cae en
+  el rango de fechas y horas. El dinero sale de `pagos`; los productos y
+  unidades, de las partidas no canceladas.
+- **Compras semanales:** consumo semanal = salidas por venta + mermas
+  aplicadas − devoluciones de venta; no incluye compras ni ajustes manuales.
+  Se usan cuatro ventanas móviles de 7 días (la más reciente pesa 4, luego 3,
+  2 y 1). Necesidad neta = consumo ponderado + `stock_minimo` − stock
+  utilizable (excluye lotes caducados).
+- Reutilizan el permiso `reportes.ver` (Administrador y Gerente) y son de solo
+  lectura: no crean compras ni modifican inventario.
 
 ### Regla de inventario (services/ventas.py)
 

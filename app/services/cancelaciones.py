@@ -188,6 +188,15 @@ def cancelar_orden(
         if estado_anterior == "Cancelada":
             raise CancelacionError("La orden ya está cancelada.")
 
+        pagado = conn.execute(
+            text("SELECT COALESCE(SUM(monto), 0) FROM pagos WHERE id_orden = :orden"),
+            {"orden": int(id_orden)},
+        ).scalar_one()
+        if pagado and pagado > 0:
+            raise CancelacionError(
+                "La orden tiene pagos registrados; requiere un reembolso."
+            )
+
         motivo = conn.execute(
             text(
                 """

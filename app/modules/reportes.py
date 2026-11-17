@@ -1,6 +1,7 @@
-"""Módulo de Reportes: ventas, productos más vendidos y bitácora forense."""
+"""Módulo de Reportes: ventas, compras semanales y bitácora forense."""
 import datetime as dt
 import json
+from decimal import Decimal
 
 import streamlit as st
 
@@ -13,54 +14,145 @@ from permissions import (
     GERENTE,
 )
 from services.bitacora import TIPOS_EVENTO, verificar_bitacora
+from services.compras_semanales import (
+    csv_compras,
+    pdf_compras,
+    sugerencia_compras,
+)
+from services.ventas_reportes import csv_ventas, datos_ventas, pdf_ventas
 
 
 def _render_ventas() -> None:
+    st.caption(
+        "Criterio: solo órdenes Pagada con pagos dentro del rango. El dinero "
+        "sale de pagos (fecha_pago) y los productos de sus partidas no "
+        "canceladas."
+    )
     col1, col2 = st.columns(2)
     with col1:
-        desde = st.date_input("Desde", value=dt.date.today() - dt.timedelta(days=30))
+        desde = st.date_input(
+            "Desde",
+            value=dt.date.today() - dt.timedelta(days=30),
+            key="ventas_desde",
+        )
     with col2:
-        hasta = st.date_input("Hasta", value=dt.date.today())
+        hasta = st.date_input(
+            "Hasta", value=dt.date.today(), key="ventas_hasta"
+        )
+    hora_desde, hora_hasta = st.slider(
+        "Rango de horas",
+        min_value=0,
+        max_value=23,
+        value=(0, 23),
+        key="ventas_horas",
+    )
+    productos = run_query(
+        "SELECT id_producto, nombre FROM productos "
+        "WHERE activo = TRUE ORDER BY nombre"
+    )
+    opciones = [0]
+    if not productos.empty:
+        opciones += [int(v) for v in productos["id_producto"]]
+    nombres = {0: "Todos los productos"}
+    nombres.update(
+        {
+            int(fila["id_producto"]): str(fila["nombre"])
+            for _, fila in productos.iterrows()
+        }
+    )
+    id_producto = st.selectbox(
+        "Producto (opcional)",
+        opciones,
+        format_func=lambda i: nombres.get(int(i), str(i)),
+        key="ventas_producto",
+    )
 
-    resumen = run_query(
-        """
-        SELECT COUNT(DISTINCT o.id_orden) AS ordenes, COALESCE(SUM(p.monto), 0) AS total_cobrado
-        FROM ordenes o
-        JOIN pagos p ON p.id_orden = o.id_orden
-        WHERE DATE(p.fecha_pago) BETWEEN :desde AND :hasta
-        """,
-        {"desde": desde, "hasta": hasta},
-    ).iloc[0]
+    datos = datos_ventas(
+        desde,
+        hasta,
+        hora_desde=hora_desde,
+        hora_hasta=hora_hasta,
+        id_producto=id_producto or None,
+    )
+    metricas = datos["metricas"]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total vendido", f"${metricas['total_vendido']:.2f}")
+    c2.metric("Órdenes", metricas["ordenes"])
+    c3.metric("Ticket promedio", f"${metricas['ticket_promedio']:.2f}")
+    c4.metric("Unidades vendidas", metricas["unidades"])
 
-    c1, c2 = st.columns(2)
-    c1.metric("Órdenes cobradas", int(resumen["ordenes"]))
-    c2.metric("Total cobrado", f"${float(resumen['total_cobrado']):.2f}")
+    if metricas["ordenes"] == 0:
+        st.info("No hay ventas pagadas en el rango y filtros seleccionados.")
+
+    st.markdown("#### Ventas por día")
+    por_dia = datos["por_dia"].set_index("fecha")["total"] if not datos["por_dia"].empty else None
+    if por_dia is not None:
+        st.line_chart(por_dia)
+    else:
+        st.caption("Sin datos para graficar.")
+
+    st.markdown("#### Ventas por hora del día")
+    st.bar_chart(datos["por_hora"].set_index("hora")["total"])
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown("#### Top 10 por unidades")
+        if datos["top_unidades"].empty:
+            st.caption("Sin productos vendidos.")
+        else:
+            st.bar_chart(
+                datos["top_unidades"].set_index("producto")["unidades"]
+            )
+            st.dataframe(
+                datos["top_unidades"], hide_index=True, use_container_width=True
+            )
+    with col_b:
+        st.markdown("#### Top 10 por importe")
+        if datos["top_importe"].empty:
+            st.caption("Sin productos vendidos.")
+        else:
+            st.bar_chart(
+                datos["top_importe"].set_index("producto")["importe"]
+                .apply(lambda v: float(v))
+            )
+            st.dataframe(
+                datos["top_importe"], hide_index=True, use_container_width=True
+            )
 
     st.markdown("#### Ventas por método de pago")
-    por_metodo = run_query(
-        """
-        SELECT mp.nombre AS metodo, COUNT(*) AS pagos, SUM(p.monto) AS total
-        FROM pagos p JOIN metodos_pago mp ON mp.id_metodo_pago = p.id_metodo_pago
-        WHERE DATE(p.fecha_pago) BETWEEN :desde AND :hasta
-        GROUP BY mp.nombre ORDER BY total DESC
-        """,
-        {"desde": desde, "hasta": hasta},
-    )
-    st.dataframe(por_metodo, use_container_width=True, hide_index=True)
+    if datos["por_metodo"].empty:
+        st.caption("Sin pagos en el rango.")
+    else:
+        st.bar_chart(datos["por_metodo"].set_index("metodo")["total"])
+        st.dataframe(
+            datos["por_metodo"], hide_index=True, use_container_width=True
+        )
 
-    st.markdown("#### Productos más vendidos")
-    top_productos = run_query(
-        """
-        SELECT pr.nombre AS producto, SUM(d.cantidad) AS unidades_vendidas, SUM(d.subtotal) AS total_vendido
-        FROM detalles_orden d
-        JOIN productos pr ON pr.id_producto = d.id_producto
-        JOIN ordenes o ON o.id_orden = d.id_orden
-        WHERE DATE(o.fecha_orden) BETWEEN :desde AND :hasta
-        GROUP BY pr.nombre ORDER BY unidades_vendidas DESC LIMIT 10
-        """,
-        {"desde": desde, "hasta": hasta},
-    )
-    st.dataframe(top_productos, use_container_width=True, hide_index=True)
+    st.markdown("#### Exportación")
+    filtros = {
+        "desde": desde,
+        "hasta": hasta,
+        "hora_desde": hora_desde,
+        "hora_hasta": hora_hasta,
+        "producto": nombres[int(id_producto)],
+    }
+    col_csv, col_pdf = st.columns(2)
+    with col_csv:
+        st.download_button(
+            "Descargar detalle CSV",
+            data=csv_ventas(datos),
+            file_name="reporte_ventas_detalle.csv",
+            mime="text/csv",
+            key="descargar_ventas_csv",
+        )
+    with col_pdf:
+        st.download_button(
+            "Descargar resumen PDF",
+            data=pdf_ventas(datos, filtros),
+            file_name="reporte_ventas.pdf",
+            mime="application/pdf",
+            key="descargar_ventas_pdf",
+        )
 
     st.markdown("#### Insumos con stock bajo")
     stock_bajo = run_query(
@@ -74,6 +166,81 @@ def _render_ventas() -> None:
         st.success("Ningún insumo por debajo de su stock mínimo.")
     else:
         st.dataframe(stock_bajo, use_container_width=True, hide_index=True)
+
+
+def _render_compras_semanales() -> None:
+    """Reporte de solo lectura; reutiliza el permiso existente reportes.ver."""
+    st.caption(
+        "Solo lectura: este reporte no crea compras. Reutiliza el permiso "
+        "reportes.ver porque Reportes ya está restringido a Administrador y "
+        "Gerente."
+    )
+    semanas = 4
+    sugerencia = sugerencia_compras(semanas=semanas)
+    if sugerencia.empty:
+        st.success("No hay insumos con necesidad de compra.")
+        return
+
+    columnas = [
+        "insumo",
+        "unidad",
+        "consumo_semana_1",
+        "consumo_semana_2",
+        "consumo_semana_3",
+        "consumo_semana_4",
+        "stock_seguridad",
+        "stock_utilizable",
+        "necesidad",
+        "costo_unitario",
+        "origen_costo",
+        "costo_estimado",
+    ]
+    etiquetas = {
+        "insumo": "Insumo",
+        "unidad": "Unidad",
+        "consumo_semana_1": "Semana 1",
+        "consumo_semana_2": "Semana 2",
+        "consumo_semana_3": "Semana 3",
+        "consumo_semana_4": "Semana 4",
+        "stock_seguridad": "Stock seguridad",
+        "stock_utilizable": "Stock utilizable",
+        "necesidad": "Necesidad",
+        "costo_unitario": "Costo unitario",
+        "origen_costo": "Origen costo",
+        "costo_estimado": "Costo estimado",
+    }
+    total_general = Decimal("0")
+    for proveedor, grupo in sugerencia.groupby("proveedor", sort=True):
+        subtotal = sum(
+            (Decimal(str(v)) for v in grupo["costo_estimado"]), Decimal("0")
+        )
+        total_general += subtotal
+        st.markdown(f"#### {proveedor}")
+        st.dataframe(
+            grupo[columnas].rename(columns=etiquetas),
+            hide_index=True,
+            use_container_width=True,
+        )
+        st.markdown(f"**Subtotal: ${subtotal:.2f}**")
+
+    st.metric("Total general", f"${total_general:.2f}")
+    col_csv, col_pdf = st.columns(2)
+    with col_csv:
+        st.download_button(
+            "Descargar compras CSV",
+            data=csv_compras(sugerencia),
+            file_name="compras_semanales.csv",
+            mime="text/csv",
+            key="descargar_compras_csv",
+        )
+    with col_pdf:
+        st.download_button(
+            "Descargar compras PDF",
+            data=pdf_compras(sugerencia, semanas=semanas),
+            file_name="compras_semanales.pdf",
+            mime="application/pdf",
+            key="descargar_compras_pdf",
+        )
 
 
 def _render_bitacora() -> None:
@@ -170,10 +337,18 @@ def render():
     st.subheader("📊 Reportes")
 
     if puede_accion("bitacora.ver"):
-        tab_ventas, tab_bitacora = st.tabs(["💰 Ventas", "🔐 Bitácora"])
+        tab_ventas, tab_compras, tab_bitacora = st.tabs(
+            ["💰 Ventas", "🛒 Compras semanales", "🔐 Bitácora"]
+        )
         with tab_ventas:
             _render_ventas()
+        with tab_compras:
+            _render_compras_semanales()
         with tab_bitacora:
             _render_bitacora()
     else:
-        _render_ventas()
+        tab_ventas, tab_compras = st.tabs(["💰 Ventas", "🛒 Compras semanales"])
+        with tab_ventas:
+            _render_ventas()
+        with tab_compras:
+            _render_compras_semanales()

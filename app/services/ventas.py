@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR, ROUND_HALF_UP
 
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Connection
@@ -1026,6 +1026,12 @@ def eliminar_partida(
         )
 
         total = recalcular_total_orden(conn, id_orden)
+        pagado = _total_pagado(conn, id_orden)
+        if pagado > 0 and total < pagado:
+            raise VentaError(
+                f"La orden ya tiene pagos por ${pagado:.2f}; no se puede "
+                "reducir por debajo de esa cantidad."
+            )
 
         # Si ya no quedan productos, se cancela la cuenta y se libera la mesa.
         if total <= 0:
@@ -1152,6 +1158,12 @@ def modificar_cantidad_partida(
             )
 
         total = recalcular_total_orden(conn, id_orden)
+        pagado = _total_pagado(conn, id_orden)
+        if pagado > 0 and total < pagado:
+            raise VentaError(
+                f"La orden ya tiene pagos por ${pagado:.2f}; no se puede "
+                "reducir por debajo de esa cantidad."
+            )
     return total
 
 
@@ -1212,6 +1224,234 @@ def limpiar_comandas_listas(id_usuario: int | None = None) -> int:
         return int(resultado.rowcount or 0)
 
 
+def _total_pagado(conn: Connection, id_orden: int) -> Decimal:
+    """Suma de abonos registrados para una orden, con dos decimales."""
+    return dinero(
+        conn.execute(
+            text("SELECT COALESCE(SUM(monto), 0) FROM pagos WHERE id_orden = :o"),
+            {"o": int(id_orden)},
+        ).scalar_one()
+    )
+
+
+def _pendientes_de_cobro(conn: Connection, id_orden: int) -> int:
+    """Partidas activas que aún no están Listo/Entregado y bloquean el cierre."""
+    return int(
+        conn.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM detalles_orden d
+                JOIN estados_detalle_orden ed ON ed.id_estado = d.id_estado
+                WHERE d.id_orden = :o
+                  AND ed.nombre NOT IN ('Listo', 'Entregado')
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM detalle_mermas m
+                      WHERE m.id_detalle = d.id_detalle
+                  )
+                """
+            ),
+            {"o": int(id_orden)},
+        ).scalar_one()
+    )
+
+
+def _registrar_pago_parcial_tx(
+    conn: Connection,
+    *,
+    id_orden: int,
+    id_mesa: int | None,
+    id_metodo_pago: int,
+    monto,
+    id_usuario: int,
+    referencia_pago: str | None = None,
+) -> dict:
+    """Implementa el abono dentro de una transacción ya abierta.
+
+    Bloquea la orden con ``FOR UPDATE`` para que dos abonos concurrentes no
+    lean el mismo saldo. El saldo se calcula siempre desde ``pagos``; nunca se
+    toma del total original menos un valor capturado en la interfaz.
+    """
+    orden = conn.execute(
+        text(
+            "SELECT id_estado, total, numero_orden_diaria, id_mesa FROM ordenes "
+            "WHERE id_orden = :o FOR UPDATE"
+        ),
+        {"o": int(id_orden)},
+    ).mappings().first()
+    if orden is None:
+        raise VentaError("La orden no existe.")
+
+    es_final = conn.execute(
+        text("SELECT es_final FROM estados_orden WHERE id_estado = :e"),
+        {"e": int(orden["id_estado"])},
+    ).scalar_one()
+    if bool(es_final):
+        raise VentaError("La orden ya fue cobrada o cancelada.")
+
+    metodo = conn.execute(
+        text(
+            """
+            SELECT nombre, requiere_referencia, activo
+            FROM metodos_pago
+            WHERE id_metodo_pago = :m
+            """
+        ),
+        {"m": int(id_metodo_pago)},
+    ).mappings().first()
+    if metodo is None or not bool(metodo["activo"]):
+        raise VentaError("El método de pago no existe o está inactivo.")
+
+    referencia = (referencia_pago or "").strip() or None
+    if bool(metodo["requiere_referencia"]) and referencia is None:
+        raise VentaError("Este método de pago requiere referencia.")
+
+    try:
+        abono = dinero(monto)
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise VentaError("El monto del abono debe ser un número válido.") from exc
+    if abono <= 0:
+        raise VentaError("El monto del abono debe ser mayor a cero.")
+
+    total = dinero(orden["total"])
+    saldo_anterior = dinero(total - _total_pagado(conn, id_orden))
+    if saldo_anterior <= 0:
+        raise VentaError("La orden no tiene saldo pendiente.")
+    if abono > saldo_anterior:
+        raise VentaError(
+            f"El abono supera el saldo pendiente de ${saldo_anterior:.2f}."
+        )
+
+    saldo_nuevo = dinero(saldo_anterior - abono)
+    if saldo_nuevo == 0 and _pendientes_de_cobro(conn, id_orden) > 0:
+        raise VentaError(
+            "No se puede cobrar: aún hay productos pendientes o en preparación. "
+            "Cocina y bar deben marcarlos como Listo o Entregado."
+        )
+
+    id_pago = conn.execute(
+        text(
+            """
+            INSERT INTO pagos
+                (id_orden, id_metodo_pago, monto, referencia_pago,
+                 id_usuario_registro)
+            VALUES (:o, :m, :monto, :ref, :u)
+            RETURNING id_pago
+            """
+        ),
+        {
+            "o": int(id_orden),
+            "m": int(id_metodo_pago),
+            "monto": abono,
+            "ref": referencia,
+            "u": int(id_usuario),
+        },
+    ).scalar_one()
+
+    registrar_evento(
+        conn,
+        tipo_evento="PAGO",
+        entidad="pagos",
+        id_entidad=int(id_pago),
+        id_usuario=int(id_usuario),
+        datos_anteriores={"saldo": saldo_anterior},
+        datos_nuevos={
+            "id_orden": int(id_orden),
+            "numero_orden_diaria": int(orden["numero_orden_diaria"]),
+            "monto": abono,
+            "id_metodo_pago": int(id_metodo_pago),
+            "metodo_pago": str(metodo["nombre"]),
+            "id_mesa": id_mesa,
+            "referencia_pago": referencia,
+            "saldo_anterior": saldo_anterior,
+            "saldo_nuevo": saldo_nuevo,
+            "parcial": saldo_nuevo > 0,
+        },
+    )
+
+    if saldo_nuevo == 0:
+        id_pagada = _id_por_nombre(
+            conn, "SELECT id_estado FROM estados_orden WHERE nombre = :n", "Pagada"
+        )
+        conn.execute(
+            text("UPDATE ordenes SET id_estado = :e WHERE id_orden = :o"),
+            {"e": id_pagada, "o": int(id_orden)},
+        )
+        if id_mesa is not None:
+            # Misma regla que el cobro completo: solo se libera la mesa si no
+            # quedan otras cuentas abiertas sobre ella.
+            conn.execute(
+                text(
+                    """
+                    UPDATE mesas
+                    SET estado = 'Disponible'
+                    WHERE id_mesa = :m
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM ordenes o
+                          JOIN estados_orden e ON e.id_estado = o.id_estado
+                          WHERE o.id_mesa = mesas.id_mesa
+                            AND o.id_orden <> :orden
+                            AND e.es_final = FALSE
+                      )
+                    """
+                ),
+                {"m": int(id_mesa), "orden": int(id_orden)},
+            )
+
+    pagos = conn.execute(
+        text(
+            """
+            SELECT p.id_pago, p.monto, p.referencia_pago, p.fecha_pago,
+                   p.id_metodo_pago, mp.nombre AS metodo_pago
+            FROM pagos p
+            JOIN metodos_pago mp ON mp.id_metodo_pago = p.id_metodo_pago
+            WHERE p.id_orden = :o
+            ORDER BY p.fecha_pago, p.id_pago
+            """
+        ),
+        {"o": int(id_orden)},
+    ).mappings().all()
+
+    return {
+        "id_orden": int(id_orden),
+        "id_pago": int(id_pago),
+        "monto": abono,
+        "saldo_anterior": saldo_anterior,
+        "saldo_restante": saldo_nuevo,
+        "pagada": saldo_nuevo == 0,
+        "pagos": [dict(fila) for fila in pagos],
+    }
+
+
+def registrar_pago_parcial(
+    *,
+    id_orden: int,
+    id_mesa: int | None,
+    id_metodo_pago: int,
+    monto,
+    id_usuario: int,
+    referencia_pago: str | None = None,
+) -> dict:
+    """Registra un abono y cierra la orden cuando el saldo llega a cero.
+
+    Regresa ``saldo_restante`` y la lista completa de ``pagos`` de la orden.
+    El método con ``requiere_referencia`` exige una referencia no vacía. Toda
+    la operación (validación, pago, estado y mesa) ocurre en una transacción.
+    """
+    with transaccion() as conn:
+        return _registrar_pago_parcial_tx(
+            conn,
+            id_orden=id_orden,
+            id_mesa=id_mesa,
+            id_metodo_pago=id_metodo_pago,
+            monto=monto,
+            id_usuario=id_usuario,
+            referencia_pago=referencia_pago,
+        )
+
+
 def cobrar_orden_mesa(*, id_orden: int, id_mesa: int | None, id_metodo_pago: int,
                       id_usuario: int, referencia_pago: str | None = None) -> Decimal:
     """Cobra una cuenta abierta: pago + orden 'Pagada' + mesa 'Disponible' (atómico)."""
@@ -1236,79 +1476,23 @@ def cobrar_orden_mesa(*, id_orden: int, id_mesa: int | None, id_metodo_pago: int
         total = dinero(orden["total"])
         if total <= 0:
             raise VentaError("La orden no tiene importe que cobrar.")
-        bloqueantes = int(
-            conn.execute(
-                text(
-                    """
-                    SELECT COUNT(*)
-                    FROM detalles_orden d
-                    JOIN estados_detalle_orden ed ON ed.id_estado = d.id_estado
-                    WHERE d.id_orden = :o
-                      AND ed.nombre NOT IN ('Listo', 'Entregado')
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM detalle_mermas m
-                          WHERE m.id_detalle = d.id_detalle
-                      )
-                    """
-                ),
-                {"o": id_orden},
-            ).scalar_one()
-        )
-        if bloqueantes > 0:
+        if _pendientes_de_cobro(conn, id_orden) > 0:
             raise VentaError(
                 "No se puede cobrar: aún hay productos pendientes o en preparación. "
                 "Cocina y bar deben marcarlos como Listo o Entregado."
             )
-        id_pagada = _id_por_nombre(
-            conn, "SELECT id_estado FROM estados_orden WHERE nombre = :n", "Pagada"
-        )
-        id_pago = conn.execute(
-            text(
-                """
-                INSERT INTO pagos (id_orden, id_metodo_pago, monto, referencia_pago, id_usuario_registro)
-                VALUES (:o, :m, :monto, :ref, :u)
-                RETURNING id_pago
-                """
-            ),
-            {"o": id_orden, "m": id_metodo_pago, "monto": total,
-             "ref": referencia_pago or None, "u": id_usuario},
-        ).scalar_one()
-        conn.execute(text("UPDATE ordenes SET id_estado = :e WHERE id_orden = :o"),
-                     {"e": id_pagada, "o": id_orden})
-        registrar_evento(
+
+        # Si ya hubo abonos, el cobro completo liquida únicamente el saldo.
+        saldo = dinero(total - _total_pagado(conn, id_orden))
+        if saldo <= 0:
+            raise VentaError("La orden no tiene saldo pendiente.")
+        resultado = _registrar_pago_parcial_tx(
             conn,
-            tipo_evento="PAGO",
-            entidad="pagos",
-            id_entidad=int(id_pago),
+            id_orden=id_orden,
+            id_mesa=id_mesa,
+            id_metodo_pago=id_metodo_pago,
+            monto=saldo,
             id_usuario=id_usuario,
-            datos_nuevos={
-                "id_orden": id_orden,
-                "numero_orden_diaria": int(orden["numero_orden_diaria"]),
-                "monto": total,
-                "id_metodo_pago": id_metodo_pago,
-                "id_mesa": id_mesa,
-                "referencia_pago": referencia_pago,
-            },
+            referencia_pago=referencia_pago,
         )
-        if id_mesa is not None:
-            # La mesa solo se libera cuando ya no tiene otras cuentas abiertas.
-            conn.execute(
-                text(
-                    """
-                    UPDATE mesas
-                    SET estado = 'Disponible'
-                    WHERE id_mesa = :m
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM ordenes o
-                          JOIN estados_orden e ON e.id_estado = o.id_estado
-                          WHERE o.id_mesa = mesas.id_mesa
-                            AND o.id_orden <> :orden
-                            AND e.es_final = FALSE
-                      )
-                    """
-                ),
-                {"m": id_mesa, "orden": id_orden},
-            )
-    return total
+    return dinero(resultado["monto"])

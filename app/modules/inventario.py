@@ -1169,8 +1169,8 @@ def render():
         else:
             with get_engine().connect() as conn:
                 utilizable = {
-                    int(fila["id_insumo"]): stock_utilizable(
-                        conn, int(fila["id_insumo"])
+                    int(fila["id_insumo"]): float(
+                        stock_utilizable(conn, int(fila["id_insumo"]))
                     )
                     for _, fila in insumos.iterrows()
                 }

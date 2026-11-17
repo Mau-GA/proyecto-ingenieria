@@ -146,3 +146,42 @@ def test_cajero1_abre_sus_modulos():
         _crear_usuario("cajero1", "Caja", 4),
         MODULOS_CAJA,
     )
+
+
+def test_ordenes_con_cuentas_abiertas_no_falla():
+    """Regresión: con cuentas abiertas de mesa y de delivery, Órdenes no debe
+    anidar expanders (StreamlitAPIException: Expanders may not be nested...)."""
+    from decimal import Decimal
+
+    from services.ventas import guardar_orden_mesa, registrar_comanda
+
+    auth = _auth_admin()
+    partida = {
+        "id_producto": 1,
+        "cantidad": 1,
+        "precio_unitario": Decimal("120"),
+        "id_area_preparacion": 1,
+    }
+    guardar_orden_mesa(
+        id_mesa=1,
+        partidas=[dict(partida)],
+        id_usuario=auth["id_usuario"],
+        id_empleado=auth["id_empleado"],
+    )
+    with get_engine().connect() as conn:
+        id_tipo = conn.execute(
+            text("SELECT id_tipo_orden FROM tipos_orden WHERE nombre = 'Plataforma Externa'")
+        ).scalar_one()
+        id_plataforma = conn.execute(
+            text("SELECT MIN(id_plataforma) FROM plataformas_externas")
+        ).scalar_one()
+    registrar_comanda(
+        partidas=[dict(partida)],
+        id_tipo_orden=id_tipo,
+        id_usuario=auth["id_usuario"],
+        id_empleado=auth["id_empleado"],
+        id_plataforma=id_plataforma,
+        referencia_externa="PRUEBA-1",
+        nombre_cliente="Cliente Prueba",
+    )
+    _validar_modulos(auth, ["ordenes"])

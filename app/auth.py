@@ -21,6 +21,8 @@ from services.bitacora import registrar_evento
 # cambiar de sesión para no filtrar estado entre usuarios.
 _CLAVES_SESION = (
     "modulo_activo",
+    "nav_modulo",
+    "navegar_a",
     "mesa_seleccionada",
     "carrito",
     "carrito_compra",

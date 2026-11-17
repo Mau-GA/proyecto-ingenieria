@@ -42,15 +42,27 @@ def render_sidebar() -> str:
                 st.rerun()
             st.stop()
 
-        actual = st.session_state.get("modulo_activo")
-        if actual not in disponibles:
-            actual = disponibles[0]
-            st.session_state["modulo_activo"] = actual
+        # Navegación pedida desde otra pantalla (p. ej. Mesas → "Abrir orden").
+        # Se aplica ANTES de crear el radio: Streamlit no permite cambiar el
+        # valor de un widget con key después de haberlo dibujado.
+        destino = st.session_state.pop("navegar_a", None)
+        if destino in disponibles:
+            st.session_state["nav_modulo"] = destino
 
+        # Si no hay selección válida (primer ingreso o rol sin ese módulo),
+        # se respeta modulo_activo si ya existía; si no, el primer módulo.
+        if st.session_state.get("nav_modulo") not in disponibles:
+            previo = st.session_state.get("modulo_activo")
+            st.session_state["nav_modulo"] = (
+                previo if previo in disponibles else disponibles[0]
+            )
+
+        # El radio usa key fija y SIN index: así su identidad no cambia entre
+        # ejecuciones y ningún clic se pierde.
         seleccion = st.radio(
             "Navegación",
             disponibles,
-            index=disponibles.index(actual),
+            key="nav_modulo",
             format_func=lambda m: ETIQUETAS.get(m, m),
             label_visibility="collapsed",
         )

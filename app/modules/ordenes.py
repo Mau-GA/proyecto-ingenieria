@@ -589,8 +589,8 @@ def _render_cobro(orden, id_mesa: int | None) -> None:
     saldo = max(total - pagado, 0.0)
     if pagado > 0:
         st.caption(
-            f"Total ${total:.2f} · Pagado ${pagado:.2f} · "
-            f"Saldo pendiente ${saldo:.2f}"
+            f"Total \\${total:.2f} · Pagado \\${pagado:.2f} · "
+            f"Saldo pendiente \\${saldo:.2f}"
         )
 
     metodo = st.selectbox(
@@ -659,7 +659,11 @@ def _render_cobro(orden, id_mesa: int | None) -> None:
             st.success(f"Orden #{numero_orden} cobrado.")
         st.rerun()
 
-    with st.expander("💳 Pago dividido"):
+    # Interruptor en lugar de st.expander: esta sección se dibuja dentro del
+    # expander "Abrir cuenta / cobrar" y Streamlit no permite anidar expanders.
+    if not st.toggle("💳 Pago dividido", key=f"mostrar_pago_dividido_{id_orden}"):
+        return
+    with st.container(border=True):
         c1, c2, c3 = st.columns(3)
         c1.metric("Total", f"${total:.2f}")
         c2.metric("Pagado", f"${pagado:.2f}")
@@ -721,8 +725,8 @@ def _render_cobro(orden, id_mesa: int | None) -> None:
                 cambio_abono = float(recibido_abono) - float(monto_abono)
                 st.caption(
                     "Cambio: "
-                    f"${max(cambio_abono, 0):.2f} · se abonan "
-                    f"${float(monto_abono):.2f} al saldo"
+                    f"\\${max(cambio_abono, 0):.2f} · se abonan "
+                    f"\\${float(monto_abono):.2f} al saldo"
                 )
 
             if st.button(
@@ -810,7 +814,11 @@ def _render_cancelacion(orden) -> None:
         st.caption("No hay motivos de cancelación activos.")
         return
 
-    with st.expander("🚫 Cancelar orden completa"):
+    # Interruptor en lugar de st.expander: esta sección se dibuja dentro del
+    # expander "Abrir cuenta / cobrar" y Streamlit no permite anidar expanders.
+    if not st.toggle("🚫 Cancelar orden completa", key=f"mostrar_cancelacion_{id_orden}"):
+        return
+    with st.container(border=True):
         st.warning(
             "Esta acción no se puede deshacer. Si la orden ya fue cobrada, "
             "el sistema no permite cancelarla: requiere un reembolso."

@@ -167,7 +167,7 @@ def _render_catalogo() -> None:
 
     if bool(seleccionado["activo"]):
         if st.button(
-            "Dar de baja (activo = FALSE)",
+            "Dar de baja",
             key=f"baja_producto_{id_producto}",
         ):
             requerir_accion("productos.gestionar")

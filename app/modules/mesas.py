@@ -36,5 +36,5 @@ def render():
             if st.button("Abrir orden", key=f"mesa_{mesa['id_mesa']}"):
                 requerir_accion("mesas.abrir_orden")
                 st.session_state["mesa_seleccionada"] = int(mesa["id_mesa"])
-                st.session_state["modulo_activo"] = "ordenes"
+                st.session_state["navegar_a"] = "ordenes"
                 st.rerun()

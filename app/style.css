@@ -95,13 +95,3 @@ div[data-testid="stMetric"], .pos-card {
     color: #ff9aa0;
 }
 
-/* Tiñe también el borde de la tarjeta que contiene el indicador. */
-div[data-testid="stVerticalBlockBorderWrapper"]:has(.kds-verde) {
-    border-left: 6px solid #2ecc71;
-}
-div[data-testid="stVerticalBlockBorderWrapper"]:has(.kds-amarillo) {
-    border-left: 6px solid #f1c40f;
-}
-div[data-testid="stVerticalBlockBorderWrapper"]:has(.kds-rojo) {
-    border-left: 6px solid var(--accent);
-}

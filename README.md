@@ -11,6 +11,18 @@ restaurante en un sistema web funcional con Streamlit + PostgreSQL + Docker.
 
 ## 0. Cambios de esta versión
 
+- **Proveedores, lotes y caducidad (Fase 6):** nueva pestaña **Compras →
+  Proveedores** (`proveedores.gestionar`, Administrador/Gerente) con alta,
+  edición, baja lógica, condiciones, vínculos insumo-proveedor y costo
+  acordado. Cada cambio de costo se guarda en
+  `historial_precios_proveedor` y en la bitácora (`PROVEEDOR`). Al recibir
+  una compra se crea un lote por partida (`lotes_insumo`), se exige fecha de
+  caducidad posterior a hoy para carnes, verduras, panadería y lácteos, y se
+  actualiza el costo de referencia con el promedio ponderado. Inventario
+  muestra **Lotes y caducidad** con existencia calculada FEFO, configuración
+  de días de aviso (`inventario.configurar`) y merma directa de lotes
+  caducados. Las ventas bloquean solo el stock atrapado en lotes caducados;
+  los lotes por vencer generan avisos, no bloqueos.
 - **Bitácora y cancelación autorizada (Fase 5):** se eliminó la tabla
   `auditoria`; los comentarios, consumos, mermas, reposiciones y reportes
   pendientes ahora viven en tablas propias (`detalle_notas`,
@@ -57,10 +69,11 @@ restaurante en un sistema web funcional con Streamlit + PostgreSQL + Docker.
   16 con UTF8/citext, puerto de BD solo en `127.0.0.1`, validación de
   variables obligatorias del `.env`.
 
-> **Si vienes de una versión anterior (Fases 1–4), recrea el volumen** para
-> que se creen las tablas de la Fase 5 (`bitacora`, `cancelaciones`,
-> `motivos_cancelacion`, tablas `detalle_*` y `mermas_pendientes`) y se
-> elimine `auditoria`:
+> **Si vienes de una versión anterior (Fases 1–5), recrea el volumen** para
+> que se creen las tablas de la Fase 6 (`lotes_insumo`,
+> `configuracion_inventario`, `proveedor_insumos`,
+> `historial_precios_proveedor`), la columna `insumos.requiere_caducidad` y
+> `mermas.id_lote`, además de los cambios de Fase 5:
 >
 > ```bash
 > docker compose down -v && docker compose up -d --build
@@ -268,10 +281,17 @@ hacia `main`. **Nunca subir `.env`** (ya está en `.gitignore`).
   solo si no quedan otras cuentas abiertas en ella.
 - **Productos:** catálogo con categoría, área de preparación y precio.
 - **Inventario:** existencias con alerta de stock mínimo, ajustes manuales
-  atómicos y bandeja de mermas pendientes. “Subir merma” confirma el costo;
-  solo las capturas manuales descuentan stock (las partidas vendidas ya lo
-  hicieron al cobrar).
-- **Compras:** compras a proveedor; cada partida suma al stock.
+  atómicos y bandeja de mermas pendientes. La pestaña **Lotes y caducidad**
+  reparte el stock entre lotes con FEFO, muestra días restantes/estado, avisa
+  lotes caducados o por vencer y permite registrar la merma de un lote
+  caducado. El stock utilizable excluye solo lotes caducados; los “por
+  vencer” no bloquean ventas. “Subir merma” confirma el costo y, si tiene
+  `id_lote`, marca el lote como desechado; solo las capturas manuales
+  descuentan stock (las partidas vendidas ya lo hicieron al cobrar).
+- **Compras:** recibe mercancía por proveedor y crea un lote por partida con
+  fecha de caducidad cuando el insumo la requiere. Actualiza stock y costo de
+  referencia promedio en la misma transacción. La pestaña **Proveedores**
+  administra el directorio, condiciones, vínculos y costos acordados.
 - **Usuarios** (solo Administrador): usuarios, roles y empleados.
 - **Reportes:** total cobrado, desglose por método de pago, productos más
   vendidos e insumos con stock bajo.
@@ -311,5 +331,14 @@ Pruebas manuales:
    solo debe ver Punto de venta, Mesas y Órdenes.
 7. **Mesas → Abrir orden → Órdenes:** agrega productos y guarda; la mesa
    pasa a *Ocupada*. Cobra: vuelve a *Disponible*.
-8. **Compras:** registra una compra y confirma que el stock sube.
-9. **Reportes:** las ventas de hoy aparecen en el rango de fechas actual.
+8. **Compras:** registra una compra y confirma que el stock sube. Prueba un
+   insumo de carnes sin fecha de caducidad: debe rechazarse sin guardar nada.
+   Con fecha futura, revisa en **Inventario → Lotes y caducidad** el lote
+   creado y el costo de referencia actualizado.
+9. **Proveedores:** crea uno, vincula un insumo con costo acordado, cámbialo
+   y verifica el historial de precios y la bitácora (`PROVEEDOR`).
+10. **Caducidad:** con un lote caducado, intenta vender un producto que use
+    ese insumo: debe bloquearse indicando el stock retenido. Registra la
+    merma desde el lote y confírmala en Gestión de Mermas; el lote queda
+    desechado y el stock baja.
+11. **Reportes:** las ventas de hoy aparecen en el rango de fechas actual.

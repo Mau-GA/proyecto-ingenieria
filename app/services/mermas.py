@@ -37,6 +37,7 @@ from sqlalchemy.engine import Connection
 from database import transaccion
 from services.cocina import registrar_historial_pendiente
 from services.modificadores import foto_de_detalle, guardar_foto_modificadores
+from services.lotes import existencias_por_lote
 from services.ventas import (
     StockInsuficienteError,
     VentaError,
@@ -728,6 +729,9 @@ def registrar_merma_insumo(
     id_usuario: int,
     id_empleado: int | None,
     motivo: str,
+    conn: Connection | None = None,
+    nombre_tipo_merma: str = "Otro",
+    id_lote: int | None = None,
 ) -> list[int]:
     """Captura una merma general de un insumo base, sin orden asociada.
 
@@ -735,6 +739,9 @@ def registrar_merma_insumo(
     ``id_movimiento = NULL`` y su fila en ``mermas_pendientes``. El Gerente la
     sube desde Inventario, donde se inserta el movimiento tipo ``Merma``, se
     descuenta ``insumos.stock_actual`` y se fija el costo de la pérdida.
+
+    ``conn`` permite participar de una transacción ya abierta. ``id_lote`` se
+    usa para mermas de caducidad y queda en ``mermas.id_lote``.
     """
     motivo = (motivo or "").strip()
     if not motivo:
@@ -749,8 +756,9 @@ def registrar_merma_insumo(
             "que lo vincule en el módulo Usuarios."
         )
 
-    with transaccion() as conn:
-        insumo = conn.execute(
+    contexto = nullcontext(conn) if conn is not None else transaccion()
+    with contexto as conexion:
+        insumo = conexion.execute(
             text(
                 """
                 SELECT i.id_insumo, i.nombre, um.abreviatura AS unidad
@@ -764,17 +772,17 @@ def registrar_merma_insumo(
         if insumo is None:
             raise MermaError("El insumo seleccionado no existe o está inactivo.")
 
-        id_tipo_merma = _id_tipo_merma(conn, "Otro")
+        id_tipo_merma = _id_tipo_merma(conexion, nombre_tipo_merma)
         descripcion = _truncar(
             f"Insumo: {insumo['nombre']} | Motivo: {motivo}", 255
         )
-        id_merma = conn.execute(
+        id_merma = conexion.execute(
             text(
                 """
                 INSERT INTO mermas
                     (id_movimiento, id_tipo_merma, id_empleado_responsable,
-                     id_usuario_registro, descripcion)
-                VALUES (NULL, :tipo, :empleado, :usuario, :descripcion)
+                     id_usuario_registro, descripcion, id_lote)
+                VALUES (NULL, :tipo, :empleado, :usuario, :descripcion, :lote)
                 RETURNING id_merma
                 """
             ),
@@ -783,11 +791,12 @@ def registrar_merma_insumo(
                 "empleado": id_empleado,
                 "usuario": id_usuario,
                 "descripcion": descripcion,
+                "lote": int(id_lote) if id_lote is not None else None,
             },
         ).scalar_one()
         id_merma = int(id_merma)
 
-        conn.execute(
+        conexion.execute(
             text(
                 """
                 INSERT INTO mermas_pendientes
@@ -795,19 +804,102 @@ def registrar_merma_insumo(
                      producto, id_empleado, id_usuario, tipo_merma)
                 VALUES
                     (:merma, :insumo, :cantidad, 'insumo', :reporte, :motivo,
-                     :producto, :empleado, :usuario, 'Otro')
+                     :producto, :empleado, :usuario, :tipo_merma)
                 """
             ),
             {
                 "merma": id_merma,
                 "insumo": int(insumo["id_insumo"]),
                 "cantidad": cantidad,
-                "reporte": f"insumo-{time.time_ns()}",
+                "reporte": (
+                    f"lote-{int(id_lote)}-{time.time_ns()}"
+                    if id_lote is not None
+                    else f"insumo-{time.time_ns()}"
+                ),
                 "motivo": motivo,
                 "producto": insumo["nombre"],
                 "empleado": id_empleado,
                 "usuario": id_usuario,
+                "tipo_merma": nombre_tipo_merma,
             },
         )
 
     return [id_merma]
+
+
+def registrar_merma_lote(
+    *,
+    id_lote: int,
+    id_usuario: int,
+    id_empleado: int | None,
+    motivo: str = "Caducidad",
+) -> list[int]:
+    """Registra la merma pendiente de la existencia restante de un lote caducado.
+
+    La cantidad se calcula con el mismo reparto FEFO usado en Inventario. No
+    toca stock todavía: la merma se confirma al subirla desde Gestión de Mermas.
+    """
+    with transaccion() as conn:
+        lote = conn.execute(
+            text(
+                """
+                SELECT l.id_lote, l.id_insumo, l.fecha_caducidad, l.desechado,
+                       i.nombre AS insumo
+                FROM lotes_insumo l
+                JOIN insumos i ON i.id_insumo = l.id_insumo
+                WHERE l.id_lote = :lote
+                FOR UPDATE OF l
+                """
+            ),
+            {"lote": int(id_lote)},
+        ).mappings().first()
+        if lote is None:
+            raise MermaError("El lote seleccionado ya no existe.")
+        if lote["desechado"]:
+            raise MermaError("Este lote ya fue desechado.")
+        hoy = conn.execute(text("SELECT CURRENT_DATE")).scalar_one()
+        if lote["fecha_caducidad"] is None:
+            raise MermaError("El lote no tiene fecha de caducidad.")
+        if lote["fecha_caducidad"] > hoy:
+            raise MermaError("Solo se pueden mermar lotes caducados.")
+        pendiente = conn.execute(
+            text(
+                """
+                SELECT 1
+                FROM mermas m
+                WHERE m.id_lote = :lote
+                  AND m.costo_estimado_perdida IS NULL
+                LIMIT 1
+                """
+            ),
+            {"lote": int(id_lote)},
+        ).scalar()
+        if pendiente:
+            raise MermaError(
+                "Este lote ya tiene una merma pendiente de autorización."
+            )
+
+        existencias = existencias_por_lote(conn, [int(lote["id_insumo"])])
+        restante = next(
+            (
+                Decimal(str(fila["cantidad_restante"]))
+                for fila in existencias
+                if fila["id_lote"] == int(id_lote)
+            ),
+            Decimal("0"),
+        )
+        if restante <= 0:
+            raise MermaError(
+                "El lote no tiene existencia disponible para mermar."
+            )
+        motivo = (motivo or "Caducidad").strip()
+        return registrar_merma_insumo(
+            id_insumo=int(lote["id_insumo"]),
+            cantidad=restante,
+            id_usuario=id_usuario,
+            id_empleado=id_empleado,
+            motivo=motivo,
+            conn=conn,
+            nombre_tipo_merma="Caducado",
+            id_lote=int(id_lote),
+        )

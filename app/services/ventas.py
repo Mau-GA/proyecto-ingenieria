@@ -37,6 +37,7 @@ from sqlalchemy.engine import Connection
 from database import get_engine, transaccion
 from services.bitacora import registrar_evento
 from services.cocina import registrar_historial_pendiente
+from services.lotes import stock_utilizable_por_insumo
 from services.modificadores import (
     ModificadorError,
     foto_de_detalle,
@@ -60,13 +61,20 @@ class Faltante:
     unidad: str
     requerido: Decimal
     disponible: Decimal
+    bloqueado: Decimal = CERO
 
 
 class StockInsuficienteError(VentaError):
     def __init__(self, faltantes: list[Faltante]):
         self.faltantes = faltantes
         detalle = "; ".join(
-            f"{f.insumo}: requiere {f.requerido:.3f} {f.unidad}, hay {f.disponible:.3f}"
+            f"{f.insumo}: requiere {f.requerido:.3f} {f.unidad}, "
+            f"hay {f.disponible:.3f} utilizable"
+            + (
+                f" ({f.bloqueado:.3f} bloqueado por caducidad)"
+                if f.bloqueado > 0
+                else ""
+            )
             for f in faltantes
         )
         super().__init__(f"Stock insuficiente — {detalle}")
@@ -350,19 +358,23 @@ def porciones_disponibles(
         filas = conn.execute(
             text(
                 """
-                SELECT r.id_producto, r.cantidad_usada, i.stock_actual
+                SELECT r.id_producto, r.id_insumo, r.cantidad_usada,
+                       i.stock_actual
                 FROM recetas r
                 JOIN insumos i ON i.id_insumo = r.id_insumo
                 """
             )
         ).all()
+        ids_insumos = sorted({int(fila[1]) for fila in filas})
+        utilizables = stock_utilizable_por_insumo(conn, ids_insumos)
         limites: dict[int, int] = {}
-        for id_producto, cantidad_usada, stock_actual in filas:
+        for id_producto, id_insumo, cantidad_usada, _stock_actual in filas:
             cantidad = Decimal(str(cantidad_usada))
             if cantidad <= 0:
                 continue
+            stock_util = utilizables.get(int(id_insumo), Decimal("0"))
             porciones = int(
-                (Decimal(str(stock_actual)) / cantidad).to_integral_value(
+                (stock_util / cantidad).to_integral_value(
                     rounding=ROUND_FLOOR
                 )
             )
@@ -414,16 +426,22 @@ def descontar_inventario(
         {"ids": sorted(consumo)},
     ).all()
     por_id = {int(r.id_insumo): r for r in stock}
+    utilizables = stock_utilizable_por_insumo(conn, sorted(consumo))
 
     faltantes = [
         Faltante(
             insumo=por_id[i].nombre,
             unidad=por_id[i].abreviatura,
             requerido=requerido,
-            disponible=Decimal(str(por_id[i].stock_actual)),
+            disponible=utilizables.get(i, Decimal("0")),
+            bloqueado=max(
+                Decimal(str(por_id[i].stock_actual))
+                - utilizables.get(i, Decimal("0")),
+                Decimal("0"),
+            ),
         )
         for i, requerido in sorted(consumo.items())
-        if Decimal(str(por_id[i].stock_actual)) < requerido
+        if utilizables.get(i, Decimal("0")) < requerido
     ]
     if faltantes:
         raise StockInsuficienteError(faltantes)

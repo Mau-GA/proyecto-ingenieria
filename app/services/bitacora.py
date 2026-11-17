@@ -34,6 +34,7 @@ TIPOS_EVENTO = {
     "MERMA",
     "COMPRA",
     "CAMBIO_PRECIO",
+    "PROVEEDOR",
     "USUARIO",
 }
 

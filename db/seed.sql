@@ -32,7 +32,9 @@ INSERT INTO permisos (id_permiso, clave, descripcion) VALUES
 (6, 'inventario.gestionar', 'Ajustar stock y registrar movimientos'),
 (7, 'compras.gestionar', 'Registrar compras a proveedores'),
 (8, 'reportes.ver', 'Consultar reportes y auditoría'),
-(9, 'catalogos.gestionar', 'Administrar productos, insumos y catálogos');
+(9, 'catalogos.gestionar', 'Administrar productos, insumos y catálogos'),
+(10, 'proveedores.gestionar', 'Administrar proveedores y costos acordados'),
+(11, 'inventario.configurar', 'Configurar avisos y reglas de inventario');
 
 -- Ejemplo de asignación inicial: ajustar según las políticas reales del negocio.
 INSERT INTO roles_permisos (id_rol, id_permiso)
@@ -109,7 +111,8 @@ INSERT INTO tipos_merma (id_tipo_merma, nombre, requiere_reporte_autoridad, desc
 (3, 'Accidente', FALSE, 'Caída, derrame u otro accidente operativo'),
 (4, 'Robo', TRUE, 'Sustracción de insumos o producto'),
 (5, 'Otro', FALSE, 'Cualquier causa no cubierta por los tipos anteriores'),
-(6, 'Cancelación de orden', FALSE, 'Partida ya preparada o entregada al cancelar la orden completa');
+(6, 'Cancelación de orden', FALSE, 'Partida ya preparada o entregada al cancelar la orden completa'),
+(7, 'Caducado', FALSE, 'Insumo vencido detectado en un lote');
 
 INSERT INTO motivos_cancelacion (id, nombre, activo) VALUES
 (1, 'Cliente se retiró', TRUE),
@@ -189,6 +192,24 @@ INSERT INTO insumos (id_insumo, nombre, descripcion, id_categoria, id_unidad_med
 (12, 'Chocolate',             'Chocolate para malteada',5, 1,  8.00, 2.00, 140.00),
 (13, 'Cafe Molido',           'Cafe premium',          5, 1,  5.00, 1.00, 220.00),
 (14, 'Leche',                 'Leche entera',          6, 2, 20.00, 5.00,  28.00);
+
+-- Insumos frescos que requieren fecha de caducidad al recibirse. Se marcan
+-- por categoría: carnes, verduras, panadería y lácteos.
+UPDATE insumos
+SET requiere_caducidad = TRUE
+WHERE id_categoria IN (1, 2, 3, 6);
+
+-- Costos acordados iniciales por proveedor. Solo son filas nuevas de
+-- proveedor_insumos; no modifican los costos de referencia del insumo.
+INSERT INTO proveedor_insumos
+    (id_proveedor, id_insumo, costo_acordado, activo) VALUES
+(1, 1, 178.00, TRUE), (1, 6,   5.80, TRUE), (1, 3, 148.00, TRUE),
+(2, 2,   7.50, TRUE), (2, 4,  38.00, TRUE), (2, 5,  33.00, TRUE),
+(2, 14, 27.00, TRUE), (3, 10, 14.50, TRUE), (3, 11, 28.00, TRUE),
+(3, 7,  88.00, TRUE), (3, 8,  92.00, TRUE), (3, 9, 105.00, TRUE);
+
+-- Días de aviso previo para lotes por vencer.
+INSERT INTO configuracion_inventario (id, dias_aviso_caducidad) VALUES (1, 2);
 
 -- id_area_preparacion se infiere de la categoría de producto usando el mismo
 -- criterio observado de forma consistente en `detalles_orden` del dump

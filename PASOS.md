@@ -257,9 +257,27 @@ docker compose exec app python crear_usuarios_prueba.py
 > docker compose exec app python crear_usuarios_prueba.py
 > ```
 >
+> **Fase 6 (proveedores, lotes y caducidad):** el cambio de esquema agrega
+> `lotes_insumo`, `configuracion_inventario`, `proveedor_insumos`,
+> `historial_precios_proveedor`, la columna `insumos.requiere_caducidad` y
+> `mermas.id_lote`. Los scripts de `db/` solo corren con el volumen vacío,
+> así que después de actualizar el código ejecuta:
+>
+> ```bash
+> docker compose down -v && docker compose up -d --build
+> docker compose exec app python set_admin_password.py
+> docker compose exec app python crear_usuarios_prueba.py
+> ```
+>
 > `down -v` **borra los datos** existentes. La bitácora es inalterable por
 > triggers y tiene retención mínima de 1 año; no se debe purgar. Su cadena de
 > hashes se verifica desde **Reportes → Bitácora**.
+>
+> Prueba rápida de Fase 6: en **Compras → Proveedores** crea un proveedor y
+> vincula un insumo con costo acordado. En **Compras → Capturar compra** elige
+> un insumo de carnes, captura una fecha futura y confirma. Revisa
+> **Inventario → Lotes y caducidad**; para probar el bloqueo, registra la
+> merma de un lote caducado y confírmala en **Gestión de Mermas**.
 
 ---
 

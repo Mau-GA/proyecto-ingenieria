@@ -28,6 +28,7 @@ import streamlit as st
 from sqlalchemy.exc import SQLAlchemyError
 
 from auth import usuario_actual
+from components.caducidades import render_alertas_caducidad
 from database import run_query
 from permissions import requerir_rol, requerir_accion, ADMIN, GERENTE, CAJA
 from services.ventas import (
@@ -334,6 +335,8 @@ def render() -> None:
     encabezado.subheader("🍔 FoodHouse")
     hoy = ventas_de_hoy()
     metrica.metric("Cobrado hoy", fmt(hoy["total"]), f"{int(hoy['ordenes'])} órdenes")
+
+    render_alertas_caducidad()
 
     if auth["id_empleado"] is None:
         st.warning("Tu usuario no está vinculado a un empleado: solo podrás vender productos "

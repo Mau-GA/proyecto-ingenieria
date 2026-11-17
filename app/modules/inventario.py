@@ -1,17 +1,27 @@
 """Módulo de Inventario: stock crítico, insumos, existencias, ajustes y mermas."""
 from decimal import Decimal
 
+import pandas as pd
 import streamlit as st
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import text
 
 from auth import usuario_actual
-from database import run_query, execute, transaccion
+from components.caducidades import render_alertas_caducidad
+from database import get_engine, run_query, execute, transaccion
 from permissions import requerir_rol, requerir_accion, ADMIN, GERENTE
 from services.bitacora import registrar_evento
+from services.lotes import (
+    ESTADO_CADUCADO,
+    actualizar_dias_aviso,
+    existencias_por_lote,
+    obtener_dias_aviso,
+    stock_utilizable,
+)
 from services.mermas import (
     PATRON_DETALLE,
     PREFIJO_MOTIVO,
+    registrar_merma_lote,
 )
 from services.ventas import VentaError, recalcular_total_orden
 
@@ -122,6 +132,7 @@ def _subir_merma_en(
         text(
             """
             SELECT m.id_merma, m.costo_estimado_perdida, m.id_movimiento,
+                   m.id_lote,
                    p.id_insumo, p.cantidad AS cantidad_pendiente,
                    p.id_empleado AS empleado_pendiente, p.producto,
                    p.motivo, p.id_orden, p.origen, p.id_detalle
@@ -304,6 +315,15 @@ def _subir_merma_en(
             "id": id_merma,
         },
     )
+    if fila["id_lote"] is not None:
+        conn.execute(
+            text(
+                "UPDATE lotes_insumo SET desechado = TRUE "
+                "WHERE id_lote = :lote"
+            ),
+            {"lote": int(fila["id_lote"])},
+        )
+
     registrar_evento(
         conn,
         tipo_evento="MERMA",
@@ -318,6 +338,7 @@ def _subir_merma_en(
             "origen": origen,
             "id_orden": id_orden,
             "id_detalle": fila["id_detalle"],
+            "id_lote": fila["id_lote"],
             "stock_actual": stock_despues,
         },
     )
@@ -984,14 +1005,143 @@ def _render_gestion_mermas() -> None:
             _render_reporte_individual(primera)
 
 
+def _render_lotes() -> None:
+    """Vista de existencia calculada por lote, avisos y merma por caducidad."""
+    st.markdown("#### Lotes y caducidad")
+    st.caption(
+        "La existencia se reparte por FEFO entre los lotes no desechados. "
+        "El stock no se modifica desde esta vista; solo se registran mermas "
+        "pendientes de autorización."
+    )
+    _render_config_caducidad()
+
+    with get_engine().connect() as conn:
+        filas = existencias_por_lote(conn)
+    if not filas:
+        st.info("No hay insumos activos con lotes registrados.")
+        return
+
+    datos = []
+    for fila in filas:
+        datos.append(
+            {
+                "Insumo": fila["insumo"],
+                "Unidad": fila["unidad"],
+                "Lote": (
+                    f"#{fila['id_lote']}"
+                    if fila["id_lote"] is not None
+                    else "Sin lote"
+                ),
+                "Fecha caducidad": fila["fecha_caducidad"],
+                "Recibido": fila["cantidad_recibida"],
+                "Restante": fila["cantidad_restante"],
+                "Días": fila["dias_para_caducar"],
+                "Estado": fila["estado"],
+            }
+        )
+    st.dataframe(
+        pd.DataFrame(datos),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    caducados = [
+        fila
+        for fila in filas
+        if fila["estado"] == ESTADO_CADUCADO
+        and fila["id_lote"] is not None
+        and Decimal(str(fila["cantidad_restante"])) > 0
+    ]
+    if not caducados:
+        st.success("No hay lotes caducados con existencia pendiente de merma.")
+        return
+
+    auth = usuario_actual()
+    st.markdown("##### Lotes caducados con existencia")
+    for fila in caducados:
+        etiqueta = (
+            f"{fila['insumo']}: {Decimal(str(fila['cantidad_restante'])):.3f} "
+            f"{fila['unidad']} (lote #{fila['id_lote']}, "
+            f"caducó {fila['fecha_caducidad']})"
+        )
+        col_info, col_accion = st.columns([4, 1])
+        col_info.write(etiqueta)
+        if col_accion.button(
+            "Registrar como merma",
+            key=f"merma_lote_{fila['id_lote']}",
+            use_container_width=True,
+        ):
+            requerir_accion("mermas.gestionar")
+            if auth["id_empleado"] is None:
+                st.error(
+                    "Tu usuario no está vinculado a una ficha de empleado, así "
+                    "que no puede registrar mermas."
+                )
+                return
+            try:
+                registrar_merma_lote(
+                    id_lote=int(fila["id_lote"]),
+                    id_usuario=int(auth["id_usuario"]),
+                    id_empleado=int(auth["id_empleado"]),
+                    motivo="Caducidad",
+                )
+            except VentaError as exc:
+                st.error(str(exc))
+            except SQLAlchemyError as exc:
+                st.error(f"No se pudo registrar la merma del lote: {exc}")
+            else:
+                st.success(
+                    "Merma pendiente creada. Autorízala en Gestión de Mermas "
+                    "para descontar el stock y marcar el lote como desechado."
+                )
+                st.rerun()
+
+
+def _render_config_caducidad() -> None:
+    with st.expander("⚙️ Días de aviso de caducidad", expanded=False):
+        dias_actuales = obtener_dias_aviso()
+        with st.form("config_caducidad"):
+            dias = st.number_input(
+                "Días de aviso",
+                min_value=0,
+                max_value=365,
+                step=1,
+                value=int(dias_actuales),
+            )
+            guardar = st.form_submit_button(
+                "Guardar configuración", use_container_width=True
+            )
+        if guardar:
+            requerir_accion("inventario.configurar")
+            auth = usuario_actual()
+            try:
+                actualizar_dias_aviso(
+                    int(dias), id_usuario=int(auth["id_usuario"])
+                )
+            except (ValueError, SQLAlchemyError) as exc:
+                st.error(f"No se pudo guardar la configuración: {exc}")
+            else:
+                st.success("Días de aviso actualizados.")
+                st.rerun()
+
+
 def render():
     requerir_rol(ADMIN, GERENTE)
     st.subheader("📦 Inventario")
+    render_alertas_caducidad()
 
-    tab_critico, tab_stock, tab_insumos, tab_ajuste, tab_mermas = st.tabs(
+    (
+        tab_critico,
+        tab_stock,
+        tab_lotes,
+        tab_insumos,
+        tab_ajuste,
+        tab_mermas,
+    ) = st.tabs(
         [
             "🚨 Stock Crítico",
             "Existencias",
+            "Lotes y caducidad",
             "Insumos",
             "Registrar ajuste",
             "Gestión de Mermas",
@@ -1017,6 +1167,17 @@ def render():
         if insumos.empty:
             st.info("No hay insumos registrados todavía.")
         else:
+            with get_engine().connect() as conn:
+                utilizable = {
+                    int(fila["id_insumo"]): stock_utilizable(
+                        conn, int(fila["id_insumo"])
+                    )
+                    for _, fila in insumos.iterrows()
+                }
+            insumos["stock_utilizable"] = insumos["id_insumo"].map(utilizable)
+            insumos["bloqueado_caducidad"] = (
+                insumos["stock_actual"] - insumos["stock_utilizable"]
+            )
             bajos = insumos[insumos["stock_bajo"] == 1]
             if not bajos.empty:
                 st.warning(f"⚠️ {len(bajos)} insumo(s) por debajo del stock mínimo.")
@@ -1030,6 +1191,9 @@ def render():
                         use_container_width=True,
                         hide_index=True,
                     )
+
+    with tab_lotes:
+        _render_lotes()
 
     with tab_insumos:
         _render_catalogo_insumos()

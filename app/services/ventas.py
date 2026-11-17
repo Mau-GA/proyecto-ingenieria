@@ -1,0 +1,1498 @@
+"""
+Ruta: proyectorestaurante/app/services/ventas.py
+
+Lógica de negocio de ventas e inventario, SIN interfaz (no usa widgets de
+Streamlit), para que la compartan FoodHouse (modules/foodhouse.py) y el
+módulo de Órdenes por mesa (modules/ordenes.py).
+
+Regla central: todo lo que pasa al vender ocurre en UNA transacción:
+
+    ordenes -> detalles_orden -> descuento de inventario por receta
+            -> total recalculado -> pagos (si se cobra en el momento)
+
+Descuento de inventario por receta:
+  1. Se calcula el consumo total por insumo sumando todas las partidas
+     (cantidad vendida x recetas.cantidad_usada). Si dos productos usan el
+     mismo insumo (p. ej. Carne Res en 3 hamburguesas) se valida la SUMA.
+  2. Se bloquean las filas de esos insumos con SELECT ... FOR UPDATE para
+     que dos cajas vendiendo a la vez no dejen el stock en negativo.
+  3. Si algún insumo no alcanza se lanza StockInsuficienteError y se hace
+     ROLLBACK de toda la venta (la columna insumos.stock_actual además tiene
+     CHECK (stock_actual >= 0) como segunda barrera en la BD).
+  4. Se registra una fila en movimientos_inventario por insumo
+     (tipo 'Salida por venta', con id_orden) y se resta insumos.stock_actual.
+
+Los productos sin receta (p. ej. uno recién dado de alta) se venden sin
+descontar nada.
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR, ROUND_HALF_UP
+
+from sqlalchemy import bindparam, text
+from sqlalchemy.engine import Connection
+
+from database import get_engine, transaccion
+from services.bitacora import registrar_evento
+from services.cocina import registrar_historial_pendiente
+from services.lotes import stock_utilizable_por_insumo
+from services.modificadores import (
+    ModificadorError,
+    foto_de_detalle,
+    guardar_foto_modificadores,
+    resolver_modificadores,
+)
+
+CERO = Decimal("0")
+
+
+# =====================================================================
+# Errores de negocio (la UI los muestra como mensajes claros)
+# =====================================================================
+class VentaError(Exception):
+    """Base de los errores de negocio de una venta."""
+
+
+@dataclass
+class Faltante:
+    insumo: str
+    unidad: str
+    requerido: Decimal
+    disponible: Decimal
+    bloqueado: Decimal = CERO
+
+
+class StockInsuficienteError(VentaError):
+    def __init__(self, faltantes: list[Faltante]):
+        self.faltantes = faltantes
+        detalle = "; ".join(
+            f"{f.insumo}: requiere {f.requerido:.3f} {f.unidad}, "
+            f"hay {f.disponible:.3f} utilizable"
+            + (
+                f" ({f.bloqueado:.3f} bloqueado por caducidad)"
+                if f.bloqueado > 0
+                else ""
+            )
+            for f in faltantes
+        )
+        super().__init__(f"Stock insuficiente — {detalle}")
+
+
+class EmpleadoRequeridoError(VentaError):
+    def __init__(self):
+        super().__init__(
+            "Tu usuario no está vinculado a una ficha de empleado y la venta "
+            "incluye productos con receta: no se puede registrar la salida de "
+            "inventario. Pide a un administrador que vincule tu usuario a un "
+            "empleado en el módulo Usuarios."
+        )
+
+
+# =====================================================================
+# Utilidades
+# =====================================================================
+def dinero(valor) -> Decimal:
+    """Decimal con 2 decimales (nunca float para montos)."""
+    return Decimal(str(valor)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _id_por_nombre(conn: Connection, sql: str, nombre: str) -> int:
+    """Busca el id de un catálogo por nombre; error claro si falta en seed.sql."""
+    valor = conn.execute(text(sql), {"n": nombre}).scalar()
+    if valor is None:
+        raise VentaError(f"Falta el registro de catálogo '{nombre}'. Revisa db/seed.sql.")
+    return int(valor)
+
+
+def _guardar_comentario(
+    conn: Connection,
+    *,
+    id_detalle: int,
+    id_usuario: int | None,
+    comentario: str | None,
+) -> None:
+    """Guarda la nota de preparación vigente de una partida.
+
+    Una sola nota por partida: si se vuelve a capturar, se actualiza la misma
+    fila de ``detalle_notas``. Órdenes y Comandas la leen con un LEFT JOIN.
+    """
+    texto = (comentario or "").strip()
+    if not texto:
+        return
+
+    conn.execute(
+        text(
+            """
+            INSERT INTO detalle_notas (id_detalle, comentario, id_usuario)
+            VALUES (:detalle, :comentario, :usuario)
+            ON CONFLICT (id_detalle) DO UPDATE
+            SET comentario = EXCLUDED.comentario,
+                id_usuario = EXCLUDED.id_usuario,
+                fecha = CURRENT_TIMESTAMP
+            """
+        ),
+        {
+            "usuario": id_usuario,
+            "detalle": id_detalle,
+            "comentario": texto,
+        },
+    )
+
+
+def guardar_consumo_detalle(
+    conn: Connection,
+    *,
+    id_detalle: int,
+    consumo: dict[int, Decimal],
+    id_usuario: int | None = None,
+) -> None:
+    """Guarda una foto del consumo exacto de una partida personalizada.
+
+    La foto vive en ``detalle_consumo``. No sustituye a
+    ``detalle_modificadores``: sirve para que una receta editada después no
+    cambie la reversa de una venta ya hecha.
+    """
+    if not consumo:
+        return
+    conn.execute(
+        text(
+            """
+            INSERT INTO detalle_consumo (id_detalle, consumo, id_usuario)
+            VALUES (:detalle, CAST(:datos AS jsonb), :usuario)
+            ON CONFLICT (id_detalle) DO UPDATE
+            SET consumo = EXCLUDED.consumo,
+                id_usuario = EXCLUDED.id_usuario,
+                fecha = CURRENT_TIMESTAMP
+            """
+        ),
+        {
+            "usuario": id_usuario,
+            "detalle": int(id_detalle),
+            "datos": json.dumps(
+                {str(k): str(v) for k, v in consumo.items()},
+                ensure_ascii=False,
+            ),
+        },
+    )
+
+
+def _consumo_guardado(
+    conn: Connection, id_detalle: int
+) -> dict[int, Decimal] | None:
+    datos = conn.execute(
+        text("SELECT consumo FROM detalle_consumo WHERE id_detalle = :detalle"),
+        {"detalle": int(id_detalle)},
+    ).scalar()
+    if not datos:
+        return None
+    return {int(k): Decimal(str(v)) for k, v in datos.items()}
+
+
+def recalcular_total_orden(conn: Connection, id_orden: int) -> Decimal:
+    """Recalcula y guarda el total de una orden.
+
+    Las partidas reportadas como merma se excluyen del cobro: su marca vive
+    en ``detalle_mermas``. Así, un producto mermado no se sigue cobrando
+    aunque permanezca visible en la cuenta para que el personal sepa qué pasó.
+    """
+    total = dinero(
+        conn.execute(
+            text(
+                """
+                SELECT COALESCE(SUM(d.subtotal), 0)
+                FROM detalles_orden d
+                WHERE d.id_orden = :o
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM detalle_mermas m
+                      WHERE m.id_detalle = d.id_detalle
+                  )
+                """
+            ),
+            {"o": id_orden},
+        ).scalar_one()
+    )
+    conn.execute(
+        text("UPDATE ordenes SET total = :t WHERE id_orden = :o"),
+        {"t": total, "o": id_orden},
+    )
+    return total
+
+
+def siguiente_numero_orden_diaria(conn: Connection) -> int:
+    """Siguiente consecutivo visible de orden para la fecha actual.
+
+    Se guarda en ``ordenes.numero_orden_diaria`` y reinicia a 1 cada día.
+    El advisory lock serializa la asignación entre transacciones simultáneas
+    para que dos órdenes del mismo día no reciban el mismo número.
+    """
+    conn.execute(
+        text(
+            "SELECT pg_advisory_xact_lock(hashtext('ordenes_dia_' || CURRENT_DATE::text))"
+        )
+    )
+    return int(
+        conn.execute(
+            text(
+                """
+                SELECT COALESCE(MAX(numero_orden_diaria), 0) + 1
+                FROM ordenes
+                WHERE DATE(fecha_orden) = CURRENT_DATE
+                """
+            )
+        ).scalar_one()
+    )
+
+
+# =====================================================================
+# Inventario
+# =====================================================================
+def _recetas_por_producto(
+    conn: Connection, ids_productos: set[int]
+) -> dict[int, dict[int, Decimal]]:
+    """Carga la receta vigente de varios productos en una sola consulta."""
+    if not ids_productos:
+        return {}
+    filas = conn.execute(
+        text(
+            "SELECT id_producto, id_insumo, cantidad_usada "
+            "FROM recetas WHERE id_producto IN :ids"
+        ).bindparams(bindparam("ids", expanding=True)),
+        {"ids": sorted(ids_productos)},
+    ).all()
+    recetas: dict[int, dict[int, Decimal]] = {}
+    for id_producto, id_insumo, cantidad_usada in filas:
+        recetas.setdefault(int(id_producto), {})[int(id_insumo)] = Decimal(
+            str(cantidad_usada)
+        )
+    return recetas
+
+
+def calcular_consumo(conn: Connection, partidas: list[dict]) -> dict[int, Decimal]:
+    """Regresa {id_insumo: cantidad_total_a_descontar} para las partidas.
+
+    Cada partida puede traer ``modificadores`` con la foto histórica. Si la
+    partida ya existe y solo se recibe ``id_detalle``, la foto se lee de
+    ``detalle_modificadores``. El consumo resultante es:
+    receta - cantidad_resta + cantidad_suma, multiplicado por la cantidad.
+    """
+    if not partidas:
+        return {}
+
+    ids_productos = {int(p["id_producto"]) for p in partidas}
+    recetas = _recetas_por_producto(conn, ids_productos)
+    consumo: dict[int, Decimal] = {}
+
+    for partida in partidas:
+        id_producto = int(partida["id_producto"])
+        cantidad = Decimal(int(partida["cantidad"]))
+        id_detalle = partida.get("id_detalle")
+        if id_detalle is not None:
+            guardado = _consumo_guardado(conn, int(id_detalle))
+            if guardado is not None:
+                for id_insumo, cantidad_guardada in guardado.items():
+                    consumo[id_insumo] = (
+                        consumo.get(id_insumo, CERO)
+                        + cantidad_guardada * cantidad
+                    )
+                continue
+
+        foto = partida.get("modificadores")
+        if foto is None and id_detalle is not None:
+            foto = foto_de_detalle(conn, int(id_detalle))
+
+        for id_insumo, cantidad_receta in recetas.get(id_producto, {}).items():
+            consumo[id_insumo] = (
+                consumo.get(id_insumo, CERO) + cantidad_receta * cantidad
+            )
+
+        for modificador in foto or []:
+            id_resta = modificador.get("id_insumo_resta")
+            if id_resta is not None:
+                id_resta = int(id_resta)
+                cantidad_resta = Decimal(str(modificador["cantidad_resta"]))
+                consumo[id_resta] = (
+                    consumo.get(id_resta, CERO) - cantidad_resta * cantidad
+                )
+
+            id_suma = modificador.get("id_insumo_suma")
+            if id_suma is not None:
+                id_suma = int(id_suma)
+                cantidad_suma = Decimal(str(modificador["cantidad_suma"]))
+                consumo[id_suma] = (
+                    consumo.get(id_suma, CERO) + cantidad_suma * cantidad
+                )
+
+    for id_insumo, cantidad in list(consumo.items()):
+        if cantidad < 0:
+            raise VentaError(
+                "Los modificadores dejan el consumo de un insumo en negativo."
+            )
+        if cantidad == 0:
+            del consumo[id_insumo]
+    return consumo
+
+
+def porciones_disponibles(
+    conn_o_none: Connection | None,
+) -> dict[int, int | None]:
+    """Porciones que alcanzan por producto con el stock actual.
+
+    Para cada producto con receta se toma el mínimo de
+    ``floor(stock_actual / cantidad_usada)`` entre todos sus insumos. Un
+    producto sin receta regresa ``None`` (sin límite calculable). Esta lectura
+    es solo informativa: la validación definitiva sigue siendo la de
+    ``descontar_inventario`` con ``FOR UPDATE``.
+    """
+
+    def _calcular(conn: Connection) -> dict[int, int | None]:
+        productos = conn.execute(
+            text("SELECT id_producto FROM productos")
+        ).scalars().all()
+        resultado: dict[int, int | None] = {
+            int(id_producto): None for id_producto in productos
+        }
+
+        filas = conn.execute(
+            text(
+                """
+                SELECT r.id_producto, r.id_insumo, r.cantidad_usada,
+                       i.stock_actual
+                FROM recetas r
+                JOIN insumos i ON i.id_insumo = r.id_insumo
+                """
+            )
+        ).all()
+        ids_insumos = sorted({int(fila[1]) for fila in filas})
+        utilizables = stock_utilizable_por_insumo(conn, ids_insumos)
+        limites: dict[int, int] = {}
+        for id_producto, id_insumo, cantidad_usada, _stock_actual in filas:
+            cantidad = Decimal(str(cantidad_usada))
+            if cantidad <= 0:
+                continue
+            stock_util = utilizables.get(int(id_insumo), Decimal("0"))
+            porciones = int(
+                (stock_util / cantidad).to_integral_value(
+                    rounding=ROUND_FLOOR
+                )
+            )
+            id_producto = int(id_producto)
+            if id_producto in limites:
+                limites[id_producto] = min(limites[id_producto], porciones)
+            else:
+                limites[id_producto] = porciones
+
+        for id_producto, porciones in limites.items():
+            resultado[id_producto] = max(0, porciones)
+        return resultado
+
+    if conn_o_none is None:
+        with get_engine().connect() as conn:
+            return _calcular(conn)
+    return _calcular(conn_o_none)
+
+
+def descontar_inventario(
+    conn: Connection,
+    *,
+    id_orden: int,
+    partidas: list[dict],
+    id_empleado: int | None,
+) -> list[dict]:
+    """
+    Descuenta el inventario según receta DENTRO de la transacción `conn`.
+    Regresa un resumen [{"insumo", "unidad", "cantidad", "stock_restante"}].
+    """
+    consumo = calcular_consumo(conn, partidas)
+    if not consumo:
+        return []  # ningún producto de la venta tiene receta
+    if id_empleado is None:
+        raise EmpleadoRequeridoError()
+
+    # Bloqueo de filas (orden por id para evitar deadlocks entre cajas)
+    stock = conn.execute(
+        text(
+            """
+            SELECT i.id_insumo, i.nombre, i.stock_actual, u.abreviatura
+            FROM insumos i
+            JOIN unidades_medida u ON u.id_unidad = i.id_unidad_medida
+            WHERE i.id_insumo IN :ids
+            ORDER BY i.id_insumo
+            FOR UPDATE
+            """
+        ).bindparams(bindparam("ids", expanding=True)),
+        {"ids": sorted(consumo)},
+    ).all()
+    por_id = {int(r.id_insumo): r for r in stock}
+    utilizables = stock_utilizable_por_insumo(conn, sorted(consumo))
+
+    faltantes = [
+        Faltante(
+            insumo=por_id[i].nombre,
+            unidad=por_id[i].abreviatura,
+            requerido=requerido,
+            disponible=utilizables.get(i, Decimal("0")),
+            bloqueado=max(
+                Decimal(str(por_id[i].stock_actual))
+                - utilizables.get(i, Decimal("0")),
+                Decimal("0"),
+            ),
+        )
+        for i, requerido in sorted(consumo.items())
+        if utilizables.get(i, Decimal("0")) < requerido
+    ]
+    if faltantes:
+        raise StockInsuficienteError(faltantes)
+
+    id_tipo = _id_por_nombre(
+        conn,
+        "SELECT id_tipo_movimiento FROM tipos_movimiento_inventario WHERE nombre = :n",
+        "Salida por venta",
+    )
+
+    conn.execute(
+        text(
+            """
+            INSERT INTO movimientos_inventario
+                (id_insumo, id_tipo_movimiento, cantidad, motivo, id_empleado, id_orden)
+            VALUES (:insumo, :tipo, :cantidad, :motivo, :empleado, :orden)
+            """
+        ),
+        [
+            {
+                "insumo": i, "tipo": id_tipo, "cantidad": cant,
+                "motivo": f"Venta orden #{id_orden} (descuento automático por receta)",
+                "empleado": id_empleado, "orden": id_orden,
+            }
+            for i, cant in sorted(consumo.items())
+        ],
+    )
+    conn.execute(
+        text("UPDATE insumos SET stock_actual = stock_actual - :c WHERE id_insumo = :i"),
+        [{"c": cant, "i": i} for i, cant in sorted(consumo.items())],
+    )
+
+    return [
+        {
+            "insumo": por_id[i].nombre,
+            "unidad": por_id[i].abreviatura,
+            "cantidad": cant,
+            "stock_restante": Decimal(str(por_id[i].stock_actual)) - cant,
+        }
+        for i, cant in sorted(consumo.items())
+    ]
+
+
+def _revertir_inventario(
+    conn: Connection,
+    *,
+    id_orden: int,
+    partida: dict,
+    id_empleado: int | None,
+    motivo: str | None = None,
+) -> None:
+    """Devuelve al stock los insumos de una partida eliminada o reducida.
+
+    Se registra un movimiento de 'Ajuste positivo' para conservar el historial
+    completo; no se borra el movimiento de salida original. ``motivo`` permite
+    distinguir una eliminación de una reducción de cantidad.
+
+    La partida debe traer la foto de ``detalle_modificadores`` cuando tenga
+    personalización. Si se omite, el consumo se calcula con la receta vigente
+    (comportamiento anterior para partidas sin modificadores).
+    """
+    consumo = calcular_consumo(conn, [partida])
+    if not consumo:
+        return
+    if id_empleado is None:
+        raise EmpleadoRequeridoError()
+
+    id_tipo = _id_por_nombre(
+        conn,
+        "SELECT id_tipo_movimiento FROM tipos_movimiento_inventario WHERE nombre = :n",
+        "Ajuste positivo",
+    )
+    conn.execute(
+        text(
+            """
+            INSERT INTO movimientos_inventario
+                (id_insumo, id_tipo_movimiento, cantidad, motivo, id_empleado, id_orden)
+            VALUES (:insumo, :tipo, :cantidad, :motivo, :empleado, :orden)
+            """
+        ),
+        [
+            {
+                "insumo": i,
+                "tipo": id_tipo,
+                "cantidad": cant,
+                "motivo": motivo
+                or f"Reversa por eliminación de partida de la orden #{id_orden}",
+                "empleado": id_empleado,
+                "orden": id_orden,
+            }
+            for i, cant in sorted(consumo.items())
+        ],
+    )
+    conn.execute(
+        text("UPDATE insumos SET stock_actual = stock_actual + :c WHERE id_insumo = :i"),
+        [{"c": cant, "i": i} for i, cant in sorted(consumo.items())],
+    )
+
+
+# =====================================================================
+# Órdenes
+# =====================================================================
+def _expandir_partidas(partidas: list[dict]) -> list[dict]:
+    """Expande cada partida en N partidas individuales de cantidad 1.
+
+    Así Comandas y Mermas pueden marcar una sola unidad (p. ej. una alita)
+    sin afectar a las demás, aunque el mesero haya capturado cantidad 3.
+    """
+    expandidas: list[dict] = []
+    for partida in partidas:
+        cantidad = int(partida["cantidad"])
+        if cantidad <= 0:
+            raise VentaError("La cantidad de cada producto debe ser mayor a cero.")
+        for _ in range(cantidad):
+            expandidas.append({**partida, "cantidad": 1})
+    return expandidas
+
+
+def _modificadores_de_entrada(partida: dict) -> tuple[list[int], list[dict]]:
+    """Separa ids de catálogo (entrada) de una foto ya resuelta (interna)."""
+    mods = partida.get("modificadores") or []
+    if not mods:
+        return [], []
+    if isinstance(mods[0], dict):
+        return [], list(mods)
+    return [int(valor) for valor in mods], []
+
+
+def agregar_partidas(
+    conn: Connection,
+    *,
+    id_orden: int,
+    partidas: list[dict],
+    id_empleado: int | None,
+    id_usuario: int | None = None,
+) -> tuple[Decimal, list[dict]]:
+    """
+    Inserta partidas en detalles_orden, descuenta inventario y recalcula el
+    total de la orden. Todo dentro de `conn`.
+
+    partidas: [{"id_producto", "cantidad", "precio_unitario",
+                "id_area_preparacion", "comentario"(opcional),
+                "modificadores"(opcional, lista de ids)}]
+    Regresa (total_actualizado_de_la_orden, resumen_inventario).
+
+    Una partida con modificadores siempre se guarda con cantidad 1 y su
+    precio unitario se calcula como precio_actual + suma de precio_extra.
+    """
+    if not partidas:
+        raise VentaError("La orden no tiene productos.")
+
+    for partida in partidas:
+        ids, foto = _modificadores_de_entrada(partida)
+        if (ids or foto) and int(partida["cantidad"]) != 1:
+            raise VentaError(
+                "Una partida personalizada debe ser de cantidad 1; "
+                "agrega otra línea para más unidades."
+            )
+
+    # Granularidad 1 a 1: cada unidad se guarda como una partida propia.
+    partidas = _expandir_partidas(partidas)
+
+    id_pendiente = _id_por_nombre(
+        conn, "SELECT id_estado FROM estados_detalle_orden WHERE nombre = :n", "Pendiente"
+    )
+    partidas_consumo: list[dict] = []
+    for p in partidas:
+        ids, foto = _modificadores_de_entrada(p)
+        if ids:
+            try:
+                foto = resolver_modificadores(
+                    conn, int(p["id_producto"]), ids
+                )
+            except ModificadorError as exc:
+                raise VentaError(str(exc)) from exc
+
+        if foto:
+            precio_base = conn.execute(
+                text(
+                    "SELECT precio_actual FROM productos "
+                    "WHERE id_producto = :p"
+                ),
+                {"p": int(p["id_producto"])},
+            ).scalar_one_or_none()
+            if precio_base is None:
+                raise VentaError("El producto seleccionado no existe.")
+            extras = sum(
+                (Decimal(str(item["precio_extra"])) for item in foto),
+                CERO,
+            )
+            precio = dinero(Decimal(str(precio_base)) + extras)
+        else:
+            precio = dinero(p["precio_unitario"])
+
+        resultado = conn.execute(
+            text(
+                """
+                INSERT INTO detalles_orden (id_orden, id_producto, cantidad,
+                                            precio_unitario, id_area_preparacion, id_estado)
+                VALUES (:orden, :producto, :cantidad, :precio, :area, :estado)
+                RETURNING id_detalle
+                """
+            ),
+            {
+                "orden": id_orden, "producto": int(p["id_producto"]),
+                "cantidad": int(p["cantidad"]), "precio": precio,
+                "area": int(p["id_area_preparacion"]), "estado": id_pendiente,
+            },
+        )
+        id_detalle = int(resultado.scalar_one())
+        # La fila "Pendiente" es la hora de recepción en cocina y debe nacer
+        # junto con la partida, dentro de esta misma transacción.
+        registrar_historial_pendiente(
+            conn,
+            id_detalle=id_detalle,
+            id_usuario=id_usuario,
+            id_estado=id_pendiente,
+        )
+        guardar_foto_modificadores(conn, id_detalle, foto)
+        if foto:
+            consumo_partida = calcular_consumo(
+                conn,
+                [
+                    {
+                        "id_producto": int(p["id_producto"]),
+                        "cantidad": int(p["cantidad"]),
+                        "modificadores": foto,
+                    }
+                ],
+            )
+            guardar_consumo_detalle(
+                conn,
+                id_detalle=id_detalle,
+                consumo=consumo_partida,
+                id_usuario=id_usuario,
+            )
+        _guardar_comentario(
+            conn,
+            id_detalle=id_detalle,
+            id_usuario=id_usuario,
+            comentario=p.get("comentario"),
+        )
+        partidas_consumo.append(
+            {**p, "modificadores": foto, "id_detalle": id_detalle}
+        )
+
+    resumen = descontar_inventario(
+        conn,
+        id_orden=id_orden,
+        partidas=partidas_consumo,
+        id_empleado=id_empleado,
+    )
+
+    # El total lo calcula la BD desde la columna generada `subtotal`, pero
+    # excluyendo las partidas ya reportadas como merma.
+    total = recalcular_total_orden(conn, id_orden)
+    return total, resumen
+
+
+def registrar_venta(
+    *,
+    partidas: list[dict],
+    id_tipo_orden: int,
+    id_usuario: int,
+    id_empleado: int | None,
+    id_metodo_pago: int,
+    id_mesa: int | None = None,
+    id_plataforma: int | None = None,
+    referencia_externa: str | None = None,
+    referencia_pago: str | None = None,
+) -> dict:
+    """
+    Venta de mostrador cobrada en el momento (FoodHouse).
+    Crea la orden en estado 'Pagada', sus partidas en 'Pendiente' (para que
+    cocina/bar las preparen), descuenta inventario y registra el pago.
+    Si cualquier paso falla -> ROLLBACK completo.
+    """
+    with transaccion() as conn:
+        id_pagada = _id_por_nombre(
+            conn, "SELECT id_estado FROM estados_orden WHERE nombre = :n", "Pagada"
+        )
+        numero_dia = siguiente_numero_orden_diaria(conn)
+        res = conn.execute(
+            text(
+                """
+                INSERT INTO ordenes (id_tipo_orden, id_mesa, id_empleado_atiende, id_usuario_registro,
+                                     id_plataforma_externa, referencia_externa, id_estado, total,
+                                     numero_orden_diaria)
+                VALUES (:tipo, :mesa, :empleado, :usuario, :plataforma, :ref_ext, :estado, 0,
+                        :numero_dia)
+                RETURNING id_orden, numero_orden_diaria
+                """
+            ),
+            {
+                "tipo": id_tipo_orden, "mesa": id_mesa, "empleado": id_empleado,
+                "usuario": id_usuario, "plataforma": id_plataforma,
+                "ref_ext": referencia_externa or None, "estado": id_pagada,
+                "numero_dia": numero_dia,
+            },
+        )
+        fila_orden = res.mappings().one()
+        id_orden = int(fila_orden["id_orden"])
+        numero_dia = int(fila_orden["numero_orden_diaria"])
+
+        total, resumen = agregar_partidas(
+            conn, id_orden=id_orden, partidas=partidas, id_empleado=id_empleado,
+            id_usuario=id_usuario,
+        )
+        if total <= 0:
+            raise VentaError("El total de la venta debe ser mayor a cero.")
+
+        id_pago = conn.execute(
+            text(
+                """
+                INSERT INTO pagos (id_orden, id_metodo_pago, monto, referencia_pago, id_usuario_registro)
+                VALUES (:orden, :metodo, :monto, :ref, :usuario)
+                RETURNING id_pago
+                """
+            ),
+            {
+                "orden": id_orden, "metodo": id_metodo_pago, "monto": total,
+                "ref": referencia_pago or None, "usuario": id_usuario,
+            },
+        ).scalar_one()
+
+        registrar_evento(
+            conn,
+            tipo_evento="PAGO",
+            entidad="pagos",
+            id_entidad=int(id_pago),
+            id_usuario=id_usuario,
+            datos_nuevos={
+                "id_orden": id_orden,
+                "numero_orden_diaria": numero_dia,
+                "monto": total,
+                "id_metodo_pago": id_metodo_pago,
+                "referencia_pago": referencia_pago,
+            },
+        )
+
+    return {
+        "id_orden": id_orden,
+        "numero_dia": numero_dia,
+        "total": total,
+        "inventario": resumen,
+    }
+
+
+def registrar_comanda(
+    *,
+    partidas: list[dict],
+    id_tipo_orden: int,
+    id_usuario: int,
+    id_empleado: int | None,
+    id_mesa: int | None = None,
+    id_plataforma: int | None = None,
+    referencia_externa: str | None = None,
+    nombre_cliente: str | None = None,
+) -> dict:
+    """Registra una comanda que queda pendiente de cobro (FoodHouse).
+
+    Crea la orden en estado 'Pendiente' (sin pago), inserta sus partidas ya
+    desglosadas 1 a 1, descuenta inventario y asigna el número de orden del
+    día. El cobro posterior se hace desde Órdenes.
+
+    ``nombre_cliente`` es obligatorio para pedidos de plataforma externa y
+    opcional para "Para Llevar". Cuando viene, se crea un registro nuevo en
+    ``clientes`` y se enlaza con ``ordenes.id_cliente`` en la misma
+    transacción; no se buscan ni reutilizan clientes existentes.
+    """
+    nombre_cliente = (nombre_cliente or "").strip() or None
+
+    with transaccion() as conn:
+        tipo = conn.execute(
+            text(
+                "SELECT nombre, requiere_plataforma FROM tipos_orden "
+                "WHERE id_tipo_orden = :tipo"
+            ),
+            {"tipo": id_tipo_orden},
+        ).mappings().first()
+        if tipo is None:
+            raise VentaError("El tipo de orden seleccionado no existe.")
+        if bool(tipo["requiere_plataforma"]) and not nombre_cliente:
+            raise VentaError(
+                "El nombre del cliente es obligatorio para pedidos de "
+                "plataforma externa."
+            )
+
+        id_cliente = None
+        if nombre_cliente:
+            id_cliente = int(
+                conn.execute(
+                    text(
+                        "INSERT INTO clientes (nombre) VALUES (:nombre) "
+                        "RETURNING id_cliente"
+                    ),
+                    {"nombre": nombre_cliente},
+                ).scalar_one()
+            )
+
+        id_pendiente = _id_por_nombre(
+            conn, "SELECT id_estado FROM estados_orden WHERE nombre = :n", "Pendiente"
+        )
+        numero_dia = siguiente_numero_orden_diaria(conn)
+        res = conn.execute(
+            text(
+                """
+                INSERT INTO ordenes (id_tipo_orden, id_mesa, id_cliente,
+                                     id_empleado_atiende, id_usuario_registro,
+                                     id_plataforma_externa, referencia_externa,
+                                     id_estado, total, numero_orden_diaria)
+                VALUES (:tipo, :mesa, :cliente, :empleado, :usuario,
+                        :plataforma, :ref_ext, :estado, 0, :numero_dia)
+                RETURNING id_orden, numero_orden_diaria
+                """
+            ),
+            {
+                "tipo": id_tipo_orden, "mesa": id_mesa, "cliente": id_cliente,
+                "empleado": id_empleado, "usuario": id_usuario,
+                "plataforma": id_plataforma,
+                "ref_ext": referencia_externa or None, "estado": id_pendiente,
+                "numero_dia": numero_dia,
+            },
+        )
+        fila_orden = res.mappings().one()
+        id_orden = int(fila_orden["id_orden"])
+        numero_dia = int(fila_orden["numero_orden_diaria"])
+
+        total, resumen = agregar_partidas(
+            conn, id_orden=id_orden, partidas=partidas, id_empleado=id_empleado,
+            id_usuario=id_usuario,
+        )
+        if total <= 0:
+            raise VentaError("La comanda debe tener un total mayor a cero.")
+
+    return {
+        "id_orden": id_orden,
+        "numero_dia": numero_dia,
+        "total": total,
+        "inventario": resumen,
+        "id_cliente": id_cliente,
+        "nombre_cliente": nombre_cliente,
+    }
+
+
+def guardar_orden_mesa(
+    *,
+    id_mesa: int,
+    partidas: list[dict],
+    id_usuario: int,
+    id_empleado: int | None,
+) -> dict:
+    """
+    Orden de mesa (cuenta abierta): reutiliza la orden no finalizada de la
+    mesa o crea una nueva en 'Pendiente', marca la mesa 'Ocupada', agrega las
+    partidas y descuenta inventario. Todo en una transacción.
+    """
+    with transaccion() as conn:
+        existente = conn.execute(
+            text(
+                """
+                SELECT o.id_orden, o.numero_orden_diaria
+                FROM ordenes o
+                JOIN estados_orden e ON e.id_estado = o.id_estado
+                WHERE o.id_mesa = :m AND e.es_final = FALSE
+                ORDER BY o.id_orden DESC LIMIT 1
+                FOR UPDATE
+                """
+            ),
+            {"m": id_mesa},
+        ).mappings().first()
+
+        if existente is None:
+            id_local = _id_por_nombre(
+                conn, "SELECT id_tipo_orden FROM tipos_orden WHERE nombre = :n", "Local"
+            )
+            id_pendiente = _id_por_nombre(
+                conn, "SELECT id_estado FROM estados_orden WHERE nombre = :n", "Pendiente"
+            )
+            numero_dia = siguiente_numero_orden_diaria(conn)
+            res = conn.execute(
+                text(
+                    """
+                    INSERT INTO ordenes (id_tipo_orden, id_mesa, id_empleado_atiende,
+                                         id_usuario_registro, id_estado, total,
+                                         numero_orden_diaria)
+                    VALUES (:tipo, :mesa, :empleado, :usuario, :estado, 0, :numero_dia)
+                    RETURNING id_orden, numero_orden_diaria
+                    """
+                ),
+                {"tipo": id_local, "mesa": id_mesa, "empleado": id_empleado,
+                 "usuario": id_usuario, "estado": id_pendiente,
+                 "numero_dia": numero_dia},
+            )
+            fila_orden = res.mappings().one()
+            id_orden = int(fila_orden["id_orden"])
+            numero_dia = int(fila_orden["numero_orden_diaria"])
+        else:
+            id_orden = int(existente["id_orden"])
+            numero_dia = int(existente["numero_orden_diaria"])
+
+        # La mesa debe quedar ocupada también al continuar una cuenta existente.
+        conn.execute(
+            text("UPDATE mesas SET estado = 'Ocupada' WHERE id_mesa = :m"),
+            {"m": id_mesa},
+        )
+
+        total, resumen = agregar_partidas(
+            conn, id_orden=id_orden, partidas=partidas, id_empleado=id_empleado,
+            id_usuario=id_usuario,
+        )
+
+    return {
+        "id_orden": id_orden,
+        "numero_dia": numero_dia,
+        "total": total,
+        "inventario": resumen,
+    }
+
+
+def eliminar_partida(
+    *,
+    id_detalle: int,
+    id_usuario: int,
+    id_empleado: int | None,
+) -> Decimal:
+    """Elimina una partida Pendiente de una orden abierta y recalcula su total.
+
+    Solo se permite mientras cocina/bar no hayan empezado la preparación.
+    También devuelve al inventario los insumos que esa partida había
+    descontado, para que la eliminación no deje consumos fantasma.
+    """
+    with transaccion() as conn:
+        fila = conn.execute(
+            text(
+                """
+                SELECT d.id_orden, d.id_producto, d.cantidad, o.id_mesa,
+                       o.numero_orden_diaria,
+                       ed.nombre AS estado_detalle
+                FROM detalles_orden d
+                JOIN ordenes o ON o.id_orden = d.id_orden
+                JOIN estados_orden e ON e.id_estado = o.id_estado
+                JOIN estados_detalle_orden ed ON ed.id_estado = d.id_estado
+                WHERE d.id_detalle = :detalle AND e.es_final = FALSE
+                FOR UPDATE OF d, o
+                """
+            ),
+            {"detalle": id_detalle},
+        ).mappings().first()
+        if fila is None:
+            raise VentaError("La partida no existe o la orden ya está cerrada.")
+        if str(fila["estado_detalle"]) != "Pendiente":
+            raise VentaError(
+                "Este producto ya está en preparación; si se perdió, "
+                "repórtalo como merma."
+            )
+
+        id_orden = int(fila["id_orden"])
+        foto = foto_de_detalle(conn, id_detalle)
+        _revertir_inventario(
+            conn,
+            id_orden=id_orden,
+            partida={
+                "id_producto": int(fila["id_producto"]),
+                "cantidad": int(fila["cantidad"]),
+                "id_detalle": id_detalle,
+                "modificadores": foto,
+            },
+            id_empleado=id_empleado,
+        )
+        conn.execute(
+            text("DELETE FROM detalles_orden WHERE id_detalle = :detalle"),
+            {"detalle": id_detalle},
+        )
+        conn.execute(
+            text("DELETE FROM detalle_notas WHERE id_detalle = :detalle"),
+            {"detalle": id_detalle},
+        )
+        conn.execute(
+            text("DELETE FROM detalle_consumo WHERE id_detalle = :detalle"),
+            {"detalle": id_detalle},
+        )
+
+        total = recalcular_total_orden(conn, id_orden)
+        pagado = _total_pagado(conn, id_orden)
+        if pagado > 0 and total < pagado:
+            raise VentaError(
+                f"La orden ya tiene pagos por ${pagado:.2f}; no se puede "
+                "reducir por debajo de esa cantidad."
+            )
+
+        # Si ya no quedan productos, se cancela la cuenta y se libera la mesa.
+        if total <= 0:
+            id_cancelada = _id_por_nombre(
+                conn, "SELECT id_estado FROM estados_orden WHERE nombre = :n", "Cancelada"
+            )
+            conn.execute(
+                text("UPDATE ordenes SET id_estado = :e WHERE id_orden = :o"),
+                {"e": id_cancelada, "o": id_orden},
+            )
+            if fila["id_mesa"] is not None:
+                conn.execute(
+                    text("UPDATE mesas SET estado = 'Disponible' WHERE id_mesa = :m"),
+                    {"m": int(fila["id_mesa"])},
+                )
+            registrar_evento(
+                conn,
+                tipo_evento="CANCELACION",
+                entidad="ordenes",
+                id_entidad=id_orden,
+                id_usuario=id_usuario,
+                datos_nuevos={
+                    "id_orden": id_orden,
+                    "numero_orden_diaria": int(fila["numero_orden_diaria"]),
+                    "motivo": "Sin partidas activas tras eliminar producto",
+                    "automatica": True,
+                },
+            )
+
+    return total
+
+
+def modificar_cantidad_partida(
+    id_detalle: int,
+    nueva_cantidad: int,
+    id_usuario: int,
+    id_empleado: int | None,
+) -> Decimal:
+    """Cambia la cantidad de una partida Pendiente y ajusta su inventario.
+
+    Solo se permite mientras cocina/bar no hayan empezado la preparación.
+    La diferencia de consumo se calcula contra la receta vigente y se aplica
+    en la misma transacción: si al subir la cantidad falta stock, hace ROLLBACK
+    completo. Al bajar, devuelve los insumos con un movimiento de entrada.
+    """
+    try:
+        nueva = int(nueva_cantidad)
+    except (TypeError, ValueError) as exc:
+        raise VentaError("La cantidad debe ser un número entero.") from exc
+    if nueva < 1:
+        raise VentaError("La cantidad debe ser al menos 1.")
+
+    with transaccion() as conn:
+        fila = conn.execute(
+            text(
+                """
+                SELECT d.id_orden, d.id_producto, d.cantidad,
+                       ed.nombre AS estado_detalle, e.es_final
+                FROM detalles_orden d
+                JOIN ordenes o ON o.id_orden = d.id_orden
+                JOIN estados_orden e ON e.id_estado = o.id_estado
+                JOIN estados_detalle_orden ed ON ed.id_estado = d.id_estado
+                WHERE d.id_detalle = :detalle
+                FOR UPDATE OF d, o
+                """
+            ),
+            {"detalle": int(id_detalle)},
+        ).mappings().first()
+        if fila is None or bool(fila["es_final"]):
+            raise VentaError("La partida no existe o la orden ya está cerrada.")
+        if str(fila["estado_detalle"]) != "Pendiente":
+            raise VentaError(
+                "Este producto ya está en preparación; si se perdió, "
+                "repórtalo como merma."
+            )
+
+        personalizada = conn.execute(
+            text(
+                "SELECT 1 FROM detalle_modificadores "
+                "WHERE id_detalle = :detalle LIMIT 1"
+            ),
+            {"detalle": int(id_detalle)},
+        ).scalar()
+        if personalizada:
+            raise VentaError(
+                "Esta partida está personalizada; agrega otra partida "
+                "para cambiar la cantidad."
+            )
+
+        id_orden = int(fila["id_orden"])
+        id_producto = int(fila["id_producto"])
+        actual = int(fila["cantidad"])
+        diferencia = nueva - actual
+
+        if diferencia > 0:
+            descontar_inventario(
+                conn,
+                id_orden=id_orden,
+                partidas=[{"id_producto": id_producto, "cantidad": diferencia}],
+                id_empleado=id_empleado,
+            )
+        elif diferencia < 0:
+            _revertir_inventario(
+                conn,
+                id_orden=id_orden,
+                partida={
+                    "id_producto": id_producto,
+                    "cantidad": abs(diferencia),
+                },
+                id_empleado=id_empleado,
+                motivo=(
+                    "Reversa por reducción de cantidad en la orden "
+                    f"#{id_orden}"
+                ),
+            )
+
+        if diferencia != 0:
+            conn.execute(
+                text(
+                    "UPDATE detalles_orden SET cantidad = :n "
+                    "WHERE id_detalle = :detalle"
+                ),
+                {"n": nueva, "detalle": int(id_detalle)},
+            )
+
+        total = recalcular_total_orden(conn, id_orden)
+        pagado = _total_pagado(conn, id_orden)
+        if pagado > 0 and total < pagado:
+            raise VentaError(
+                f"La orden ya tiene pagos por ${pagado:.2f}; no se puede "
+                "reducir por debajo de esa cantidad."
+            )
+    return total
+
+
+def limpiar_comandas_listas(id_usuario: int | None = None) -> int:
+    """Pasa todas las partidas en ``Listo`` a ``Entregado`` en una transacción.
+
+    Registra una fila de historial por cada partida movida para que el KDS
+    conserve la hora y el usuario de la entrega.
+    """
+    with transaccion() as conn:
+        id_listo = _id_por_nombre(
+            conn,
+            "SELECT id_estado FROM estados_detalle_orden WHERE nombre = :n",
+            "Listo",
+        )
+        id_entregado = _id_por_nombre(
+            conn,
+            "SELECT id_estado FROM estados_detalle_orden WHERE nombre = :n",
+            "Entregado",
+        )
+        ids = [
+            int(valor)
+            for valor in conn.execute(
+                text(
+                    "SELECT id_detalle FROM detalles_orden "
+                    "WHERE id_estado = :listo FOR UPDATE"
+                ),
+                {"listo": id_listo},
+            ).scalars()
+        ]
+        if not ids:
+            return 0
+
+        resultado = conn.execute(
+            text(
+                "UPDATE detalles_orden SET id_estado = :entregado "
+                "WHERE id_estado = :listo"
+            ),
+            {"entregado": id_entregado, "listo": id_listo},
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO historial_estado_detalle
+                    (id_detalle, id_estado, id_usuario)
+                VALUES (:detalle, :estado, :usuario)
+                """
+            ),
+            [
+                {
+                    "detalle": id_detalle,
+                    "estado": id_entregado,
+                    "usuario": id_usuario,
+                }
+                for id_detalle in ids
+            ],
+        )
+        return int(resultado.rowcount or 0)
+
+
+def _total_pagado(conn: Connection, id_orden: int) -> Decimal:
+    """Suma de abonos registrados para una orden, con dos decimales."""
+    return dinero(
+        conn.execute(
+            text("SELECT COALESCE(SUM(monto), 0) FROM pagos WHERE id_orden = :o"),
+            {"o": int(id_orden)},
+        ).scalar_one()
+    )
+
+
+def _pendientes_de_cobro(conn: Connection, id_orden: int) -> int:
+    """Partidas activas que aún no están Listo/Entregado y bloquean el cierre."""
+    return int(
+        conn.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM detalles_orden d
+                JOIN estados_detalle_orden ed ON ed.id_estado = d.id_estado
+                WHERE d.id_orden = :o
+                  AND ed.nombre NOT IN ('Listo', 'Entregado')
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM detalle_mermas m
+                      WHERE m.id_detalle = d.id_detalle
+                  )
+                """
+            ),
+            {"o": int(id_orden)},
+        ).scalar_one()
+    )
+
+
+def _registrar_pago_parcial_tx(
+    conn: Connection,
+    *,
+    id_orden: int,
+    id_mesa: int | None,
+    id_metodo_pago: int,
+    monto,
+    id_usuario: int,
+    referencia_pago: str | None = None,
+) -> dict:
+    """Implementa el abono dentro de una transacción ya abierta.
+
+    Bloquea la orden con ``FOR UPDATE`` para que dos abonos concurrentes no
+    lean el mismo saldo. El saldo se calcula siempre desde ``pagos``; nunca se
+    toma del total original menos un valor capturado en la interfaz.
+    """
+    orden = conn.execute(
+        text(
+            "SELECT id_estado, total, numero_orden_diaria, id_mesa FROM ordenes "
+            "WHERE id_orden = :o FOR UPDATE"
+        ),
+        {"o": int(id_orden)},
+    ).mappings().first()
+    if orden is None:
+        raise VentaError("La orden no existe.")
+
+    es_final = conn.execute(
+        text("SELECT es_final FROM estados_orden WHERE id_estado = :e"),
+        {"e": int(orden["id_estado"])},
+    ).scalar_one()
+    if bool(es_final):
+        raise VentaError("La orden ya fue cobrada o cancelada.")
+
+    metodo = conn.execute(
+        text(
+            """
+            SELECT nombre, requiere_referencia, activo
+            FROM metodos_pago
+            WHERE id_metodo_pago = :m
+            """
+        ),
+        {"m": int(id_metodo_pago)},
+    ).mappings().first()
+    if metodo is None or not bool(metodo["activo"]):
+        raise VentaError("El método de pago no existe o está inactivo.")
+
+    referencia = (referencia_pago or "").strip() or None
+    if bool(metodo["requiere_referencia"]) and referencia is None:
+        raise VentaError("Este método de pago requiere referencia.")
+
+    try:
+        abono = dinero(monto)
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise VentaError("El monto del abono debe ser un número válido.") from exc
+    if abono <= 0:
+        raise VentaError("El monto del abono debe ser mayor a cero.")
+
+    total = dinero(orden["total"])
+    saldo_anterior = dinero(total - _total_pagado(conn, id_orden))
+    if saldo_anterior <= 0:
+        raise VentaError("La orden no tiene saldo pendiente.")
+    if abono > saldo_anterior:
+        raise VentaError(
+            f"El abono supera el saldo pendiente de ${saldo_anterior:.2f}."
+        )
+
+    saldo_nuevo = dinero(saldo_anterior - abono)
+    if saldo_nuevo == 0 and _pendientes_de_cobro(conn, id_orden) > 0:
+        raise VentaError(
+            "No se puede cobrar: aún hay productos pendientes o en preparación. "
+            "Cocina y bar deben marcarlos como Listo o Entregado."
+        )
+
+    id_pago = conn.execute(
+        text(
+            """
+            INSERT INTO pagos
+                (id_orden, id_metodo_pago, monto, referencia_pago,
+                 id_usuario_registro)
+            VALUES (:o, :m, :monto, :ref, :u)
+            RETURNING id_pago
+            """
+        ),
+        {
+            "o": int(id_orden),
+            "m": int(id_metodo_pago),
+            "monto": abono,
+            "ref": referencia,
+            "u": int(id_usuario),
+        },
+    ).scalar_one()
+
+    registrar_evento(
+        conn,
+        tipo_evento="PAGO",
+        entidad="pagos",
+        id_entidad=int(id_pago),
+        id_usuario=int(id_usuario),
+        datos_anteriores={"saldo": saldo_anterior},
+        datos_nuevos={
+            "id_orden": int(id_orden),
+            "numero_orden_diaria": int(orden["numero_orden_diaria"]),
+            "monto": abono,
+            "id_metodo_pago": int(id_metodo_pago),
+            "metodo_pago": str(metodo["nombre"]),
+            "id_mesa": id_mesa,
+            "referencia_pago": referencia,
+            "saldo_anterior": saldo_anterior,
+            "saldo_nuevo": saldo_nuevo,
+            "parcial": saldo_nuevo > 0,
+        },
+    )
+
+    if saldo_nuevo == 0:
+        id_pagada = _id_por_nombre(
+            conn, "SELECT id_estado FROM estados_orden WHERE nombre = :n", "Pagada"
+        )
+        conn.execute(
+            text("UPDATE ordenes SET id_estado = :e WHERE id_orden = :o"),
+            {"e": id_pagada, "o": int(id_orden)},
+        )
+        if id_mesa is not None:
+            # Misma regla que el cobro completo: solo se libera la mesa si no
+            # quedan otras cuentas abiertas sobre ella.
+            conn.execute(
+                text(
+                    """
+                    UPDATE mesas
+                    SET estado = 'Disponible'
+                    WHERE id_mesa = :m
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM ordenes o
+                          JOIN estados_orden e ON e.id_estado = o.id_estado
+                          WHERE o.id_mesa = mesas.id_mesa
+                            AND o.id_orden <> :orden
+                            AND e.es_final = FALSE
+                      )
+                    """
+                ),
+                {"m": int(id_mesa), "orden": int(id_orden)},
+            )
+
+    pagos = conn.execute(
+        text(
+            """
+            SELECT p.id_pago, p.monto, p.referencia_pago, p.fecha_pago,
+                   p.id_metodo_pago, mp.nombre AS metodo_pago
+            FROM pagos p
+            JOIN metodos_pago mp ON mp.id_metodo_pago = p.id_metodo_pago
+            WHERE p.id_orden = :o
+            ORDER BY p.fecha_pago, p.id_pago
+            """
+        ),
+        {"o": int(id_orden)},
+    ).mappings().all()
+
+    return {
+        "id_orden": int(id_orden),
+        "id_pago": int(id_pago),
+        "monto": abono,
+        "saldo_anterior": saldo_anterior,
+        "saldo_restante": saldo_nuevo,
+        "pagada": saldo_nuevo == 0,
+        "pagos": [dict(fila) for fila in pagos],
+    }
+
+
+def registrar_pago_parcial(
+    *,
+    id_orden: int,
+    id_mesa: int | None,
+    id_metodo_pago: int,
+    monto,
+    id_usuario: int,
+    referencia_pago: str | None = None,
+) -> dict:
+    """Registra un abono y cierra la orden cuando el saldo llega a cero.
+
+    Regresa ``saldo_restante`` y la lista completa de ``pagos`` de la orden.
+    El método con ``requiere_referencia`` exige una referencia no vacía. Toda
+    la operación (validación, pago, estado y mesa) ocurre en una transacción.
+    """
+    with transaccion() as conn:
+        return _registrar_pago_parcial_tx(
+            conn,
+            id_orden=id_orden,
+            id_mesa=id_mesa,
+            id_metodo_pago=id_metodo_pago,
+            monto=monto,
+            id_usuario=id_usuario,
+            referencia_pago=referencia_pago,
+        )
+
+
+def cobrar_orden_mesa(*, id_orden: int, id_mesa: int | None, id_metodo_pago: int,
+                      id_usuario: int, referencia_pago: str | None = None) -> Decimal:
+    """Cobra una cuenta abierta: pago + orden 'Pagada' + mesa 'Disponible' (atómico)."""
+    with transaccion() as conn:
+        orden = conn.execute(
+            text(
+                "SELECT id_estado, total, numero_orden_diaria FROM ordenes "
+                "WHERE id_orden = :o FOR UPDATE"
+            ),
+            {"o": id_orden},
+        ).mappings().first()
+        if orden is None:
+            raise VentaError("La orden no existe.")
+
+        es_final = conn.execute(
+            text("SELECT es_final FROM estados_orden WHERE id_estado = :e"),
+            {"e": int(orden["id_estado"])},
+        ).scalar_one()
+        if bool(es_final):
+            raise VentaError("La orden ya fue cobrada o cancelada.")
+
+        total = dinero(orden["total"])
+        if total <= 0:
+            raise VentaError("La orden no tiene importe que cobrar.")
+        if _pendientes_de_cobro(conn, id_orden) > 0:
+            raise VentaError(
+                "No se puede cobrar: aún hay productos pendientes o en preparación. "
+                "Cocina y bar deben marcarlos como Listo o Entregado."
+            )
+
+        # Si ya hubo abonos, el cobro completo liquida únicamente el saldo.
+        saldo = dinero(total - _total_pagado(conn, id_orden))
+        if saldo <= 0:
+            raise VentaError("La orden no tiene saldo pendiente.")
+        resultado = _registrar_pago_parcial_tx(
+            conn,
+            id_orden=id_orden,
+            id_mesa=id_mesa,
+            id_metodo_pago=id_metodo_pago,
+            monto=saldo,
+            id_usuario=id_usuario,
+            referencia_pago=referencia_pago,
+        )
+    return dinero(resultado["monto"])
